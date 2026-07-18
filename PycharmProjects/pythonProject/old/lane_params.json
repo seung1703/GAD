@@ -1,0 +1,11 @@
+{
+  "white_L": 175,
+  "white_S_max": 255,
+  "margin": 80,
+  "ROI_TOP_Y": 411,
+  "ROI_BOT_Y": 720,
+  "ROI_TOP_L": 377,
+  "ROI_TOP_R": 967,
+  "ROI_BOT_L": 164,
+  "ROI_BOT_R": 1138
+}
