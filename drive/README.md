@@ -7,7 +7,7 @@ shared/        공용 모듈: config.py(파라미터), control.py(PD제어),
 dl_model/      딥러닝 주행 (메인): main_model.py 실행
                model/lane_seg_best.pt = YOLO11n-seg (dash/lane/solid)
 cv_classic/    구버전 OpenCV(centroid) 방식 백업: main.py
-car_firmware/  아두이노 Mega 펌웨어 (.ino) — 업로드 필요
+../firmware/   아두이노 Mega 통합 펌웨어(firmware.ino) — 주행·장애물 공용, 업로드 필요
 tools/         카메라 인덱스 확인 등 진단 툴
 ```
 

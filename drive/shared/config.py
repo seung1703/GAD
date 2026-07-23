@@ -1,0 +1,100 @@
+"""
+config.py -- 모든 튜닝 파라미터를 JSON 하나로 관리.
+
+calibrate.py 가 저장하고 main.py 가 읽는다.
+대회장에서 바꾸는 건 전부 여기(=calib.json)로 모인다. 코드 수정 없이 값만 교체.
+"""
+
+import json
+import os
+
+DEFAULTS = {
+    # ── 카메라 ──────────────────────────────────────────────
+    "cam_index": 0,          # 노트북이 인식하는 캡처 장치 인덱스 (0/1 실측 확인)
+    "camera_id": 3,          # 실물 카메라 라벨 = 주행용 3번 → camera3_intrinsic.txt
+    "frame_w": 640,          # 낮은 해상도 = 빠른 루프. 640x360이면 충분
+    "frame_h": 360,
+    "undistort": 1,          # 1=렌즈 왜곡 보정 (camera<camera_id>_intrinsic.txt 사용)
+                             #   시작 시 remap맵 1회 생성 → 프레임당 ~0.2ms
+                             # 0=끔 (오버헤드 0, 보정 전 원본)
+
+    # ── ROI (바닥 차선 영역만) : 비율로 지정 ─────────────────
+    "roi_y_top": 0.55,       # 화면 위 55%는 버림 (배경/심판 차단)
+    "roi_y_bot": 0.98,
+    "roi_x_left": 0.0,
+    "roi_x_right": 1.0,
+
+    # ── 흰색 검출 (조명 강건) ────────────────────────────────
+    "sat_max": 80,           # HSV S 상한: 흰색은 채도 낮음
+    "use_otsu": 1,           # 1=Otsu 자동 임계 (V채널, CLAHE 후)
+    "v_min_floor": 140,      # Otsu가 너무 낮게 잡는 것 방지 하한
+    "use_adaptive": 1,       # 1=adaptiveThreshold 병행 (부분 햇빛 대응)
+    "adaptive_block": 41,    # 홀수
+    "adaptive_C": -12,
+    "clahe_clip": 2.5,
+
+    # ── centroid 밴드 ────────────────────────────────────────
+    "n_bands": 5,            # ROI를 가로 밴드 5개로
+    "min_pix_band": 25,      # 밴드당 이 픽셀 미만이면 미검출
+    "track_win_px": 90,      # 이전 라인 위치 ±win 만 탐색 (점선/노이즈 배제)
+    "line_side": "right",    # 반시계 2차선 → 바깥 실선은 차 오른쪽
+
+    # ── 추종 목표 ────────────────────────────────────────────
+    "offset_px": 150,        # 실선에서 왼쪽으로 이만큼 떨어진 지점이 목표
+                             # (= 차로 중앙. 워핑 안 하므로 픽셀로 직접 튜닝)
+    # ── 제어 ────────────────────────────────────────────────
+    "kp": 1.4,               # 정규화 오차(-1..1) → 조향 명령(-1..1)
+    "kd": 6.0,               # D게인: 코너 탈출 시 핸들 미리 풀기 (오버슈트 억제)
+    "steer_right_gain": 1.0, # 우회전만 추가 배율 (1.0=좌우 대칭)
+    "steer_sign": -1,         # 차가 반대로 꺾으면 -1로
+    "lost_hold_frames": 8,   # 라인 로스트 시 마지막 조향 유지 프레임
+    "lost_stop_frames": 30,  # 이 이상 로스트면 안전 정지
+
+    # ── 주행 ────────────────────────────────────────────────
+    "drive_pwm": 70,         # 뒷바퀴 PWM (네 DRIVE_SPEED)
+    "slow_pwm": 55,          # 조향 클 때 감속 PWM
+    "slow_steer_thresh": 0.55,  # |조향|이 이 이상이면 감속
+    "brake_ramp_pwm": 6,     # 일반 정지(x키) 시 프레임당 PWM 감소량 (30fps 기준
+                             # 135→0 약 0.75초). 비상정지/로스트 정지는 즉시
+
+    # ── 딥러닝 모델 (lane_model.py) ─────────────────────────────
+    "model_imgsz": 320,      # 추론 입력 크기. 320=10ms/f, 640=32ms/f (M3 CPU 실측)
+    "model_conf": 0.4,       # 검출 신뢰도 임계값
+    "model_device": "cpu",   # "cpu" 권장 (mps는 간헐 NMS 지연 있음)
+    "reacquire_frames": 8,   # 한쪽 선을 이 프레임 수만큼 못 보면 추적 리셋(재획득)
+    "record_every": 3,       # --record 시 N프레임마다 1장 저장 (30fps→10fps)
+    "curve_gain": 0.8,       # 곡률 피드포워드 게인 (커브 선회 부족→올리고, 지그재그→내리고)
+    "lookahead_gain": 4.0,   # 먼 밴드 가중 배율. 긴 코너 안쪽 파고들면→내리고, 늦게 돌면→올리고
+    "heading_gain": 0.5,     # 헤딩(차선 대비 차체 틀어짐) 보정 게인. 0=끔 (Stanley식)
+
+    # ── IPM (버드아이뷰 변환) : 사다리꼴 네 모서리 개별 지정 ────
+    # 각 값은 프레임 크기 대비 비율. x는 1.0 초과/음수 허용(화면 밖 코너).
+    "ipm_tl_x": 0.25,  "ipm_tl_y": 0.40,   # 좌상
+    "ipm_tr_x": 0.75,  "ipm_tr_y": 0.40,   # 우상
+    "ipm_bl_x": -0.40, "ipm_bl_y": 0.98,   # 좌하
+    "ipm_br_x": 1.40,  "ipm_br_y": 0.98,   # 우하
+    "center_offset": 0,      # 중심 보정(px). 양수→기준 오른쪽→차 왼쪽 보정
+
+    # (포텐 캘리브레이션은 통합 펌웨어 firmware/firmware.ino의 STEER_* 가 전담.
+    #  파이썬은 정규화 조향 -1..1 만 보낸다.)
+
+    # ── 시리얼 ──────────────────────────────────────────────
+    "serial_port": "/dev/tty.usbmodem*",   # 맥. 자동 글롭 탐색
+    "baud": 115200,
+}
+
+PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calib.json")
+
+
+def load():
+    cfg = dict(DEFAULTS)
+    if os.path.exists(PATH):
+        with open(PATH) as f:
+            cfg.update(json.load(f))
+    return cfg
+
+
+def save(cfg):
+    with open(PATH, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    print(f"[config] saved -> {PATH}")

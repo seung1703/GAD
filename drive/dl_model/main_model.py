@@ -29,6 +29,11 @@ from config import load, save
 from lane_model import ModelLaneDetector
 from control import LaneFollowController
 from serial_driver import MegaLink
+from undistort import Undistorter
+
+# camera_intrinsic 폴더: self_drive/camera_intrinsic (이 파일 기준 ../../)
+INTRINSIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "..", "..", "camera_intrinsic")
 
 # ── 전역 비상정지 ──
 try:
@@ -186,6 +191,11 @@ def main():
         print("카메라 열기 실패. cam_index 확인")
         return
 
+    # 렌즈 왜곡 보정기 (시작 시 remap맵 1회 생성; 파일 없으면 pass-through)
+    und = Undistorter(cfg.get("camera_id", cfg["cam_index"]),
+                      int(cfg["frame_w"]), int(cfg["frame_h"]), INTRINSIC_DIR,
+                      enabled=bool(cfg.get("undistort", 1)))
+
     det = ModelLaneDetector(cfg)   # 모델 경로는 lane_model.py 기본값(자기 폴더 기준) 사용
     ctrl = LaneFollowController(kp=cfg["kp"], kd=cfg.get("kd", 6.0),
                                 steer_sign=cfg["steer_sign"],
@@ -234,6 +244,7 @@ def main():
     show_debug = True
     tune_mode = False   # 't': 추론 일시정지 + 마지막 마스크 재사용 (트랙바 반응속도 ↑)
     last_steer = 0.0
+    cur_pwm = 0.0       # 현재 출력 PWM (정지 시 램프 감속용)
     lost_frames = 0
     t0, frames = time.time(), 0
     VW, VH = 640, 360
@@ -244,6 +255,7 @@ def main():
             ok, frame = cap.read()
             if not ok:
                 break
+            frame = und(frame)   # 렌즈 왜곡 보정 (비활성 시 원본 그대로)
 
             # ── 트랙바에서 설정 읽기 ──
             try:
@@ -290,16 +302,25 @@ def main():
                 else:
                     steer = last_steer * 0.5
 
-            # ── 구동 명령 ──
-            pwm = 0
-            if running:
-                if lost_frames > cfg["lost_stop_frames"]:
-                    link.send_brake()
-                else:
-                    pwm = int(cfg["drive_pwm"])
-                    if abs(steer) > cfg["slow_steer_thresh"]:
-                        pwm = int(cfg["slow_pwm"])
-                    link.send_drive(pwm, steer)
+            # ── 구동 명령 (일반 정지는 램프 감속, 비상/로스트 정지는 즉시) ──
+            if running and lost_frames <= cfg["lost_stop_frames"]:
+                target_pwm = int(cfg["drive_pwm"])
+                if abs(steer) > cfg["slow_steer_thresh"]:
+                    target_pwm = int(cfg["slow_pwm"])
+            else:
+                target_pwm = 0
+                if running:          # 로스트 초과 정지는 안전상 즉시
+                    cur_pwm = 0.0
+
+            ramp = float(cfg.get("brake_ramp_pwm", 6))
+            if target_pwm < cur_pwm:
+                cur_pwm = max(target_pwm, cur_pwm - ramp)  # 서서히 감속
+            else:
+                cur_pwm = float(target_pwm)                # 가속/유지는 즉시
+
+            pwm = int(round(cur_pwm))
+            if pwm > 0:
+                link.send_drive(pwm, steer)  # 감속 중에도 조향은 계속 유지
             else:
                 link.send_brake()
 
@@ -317,6 +338,7 @@ def main():
             if _ESTOP["stop"]:
                 _ESTOP["stop"] = False
                 running = False
+                cur_pwm = 0.0        # 비상정지는 램프 없이 즉시
                 link.send_brake()
                 print("[estop] 비상정지!")
             if _ESTOP["quit"]:
@@ -371,6 +393,7 @@ def main():
                 tune_mode = not tune_mode
                 if tune_mode:
                     running = False
+                    cur_pwm = 0.0
                     link.send_brake()   # 튜닝 중 주행 금지 (오래된 마스크)
                 print(f"[main_model] TUNE {'ON (추론 정지)' if tune_mode else 'OFF'}")
             elif k == ord('w'):
