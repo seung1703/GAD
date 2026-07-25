@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-main_model.py -- AI 모델 차선추종 + ROI 실시간 설정 + 대시보드
+main_model.py -- AI 모델 차선추종 (자동 IPM 캘리브레이션, ROI 트랙바 없음)
 
-  카메라 → YOLO 차선 검출 → P제어 → 시리얼(Mega)
+dl_model/main_model.py 와 동일하되, IPM 사다리꼴을 사람이 트랙바로 맞추는 대신
+lane_model.py가 매 프레임 소실점을 계산해서 스스로 잡는다 (자세한 원리는
+lane_model.py 상단 docstring 참고). 그래서 IPM 관련 트랙바 8개가 사라지고,
+대신 자동 캘리브레이션 민감도(VP margin)와 스무딩(Smooth) 트랙바가 생겼다.
 
 실행:
   python3 main_model.py            # 실제 주행
   python3 main_model.py --dry      # 시리얼 없이 비전만
   python3 main_model.py --cam 1    # 카메라 지정
   python3 main_model.py --record   # 주행하며 데이터셋 녹화
-                                   # (records/run_*/ 에 원본 JPG + labels.csv)
 
 키:
-  s=출발  x/Space=정지  q=종료  w=설정저장  d=디버그토글
+  s=출발  x/Space=정지  q=종료  w=설정저장  d=디버그토글  t=튠모드
   ESC=비상정지(전역)  F12=종료(전역)
 """
 import os
@@ -29,11 +31,6 @@ from config import load, save
 from lane_model import ModelLaneDetector
 from control import LaneFollowController
 from serial_driver import MegaLink
-from undistort import Undistorter
-
-# camera_intrinsic 폴더: self_drive/camera_intrinsic (이 파일 기준 ../../)
-INTRINSIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "..", "..", "camera_intrinsic")
 
 # ── 전역 비상정지 ──
 try:
@@ -55,11 +52,11 @@ except ImportError:
 
 # ── UI 팔레트 (BGR) ──────────────────────────────────────────
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-BG      = (28, 26, 24)     # 배경
-PANEL   = (46, 42, 38)     # 바/패널
-OUTLINE = (70, 63, 57)     # 테두리
-TXT     = (232, 227, 220)  # 본문
-DIM     = (145, 137, 128)  # 보조 텍스트
+BG      = (28, 26, 24)
+PANEL   = (46, 42, 38)
+OUTLINE = (70, 63, 57)
+TXT     = (232, 227, 220)
+DIM     = (145, 137, 128)
 GREEN   = (105, 205, 95)
 AMBER   = (55, 175, 255)
 RED     = (80, 80, 245)
@@ -70,7 +67,6 @@ def _text(img, s, xy, scale=0.45, color=TXT, thick=1):
 
 
 def _bar(img, x, y, w, h, val, label, flip=False):
-    """중앙 기준 수평 바 (-1~1). flip=True면 화면 방향=실제 진행 방향으로 뒤집음."""
     f = -val if flip else val
     cv2.rectangle(img, (x, y), (x + w, y + h), PANEL, -1)
     cv2.rectangle(img, (x, y), (x + w, y + h), OUTLINE, 1)
@@ -91,7 +87,6 @@ def _bar(img, x, y, w, h, val, label, flip=False):
 
 
 def _title(img, text):
-    """뷰 상단 반투명 타이틀 스트립"""
     ov = img.copy()
     cv2.rectangle(ov, (0, 0), (img.shape[1], 26), BG, -1)
     cv2.addWeighted(ov, 0.6, img, 0.4, 0, dst=img)
@@ -99,13 +94,11 @@ def _title(img, text):
 
 
 def _dashboard(total_w, running, steer, err, found, lost, fps, pwm, offset,
-               tune=False):
-    """상태 대시보드 (세로 배치용 컴팩트 레이아웃, 폭 640 기준)"""
+               calib_mode="INIT", tune=False):
     H = 146
     d = np.full((H, total_w, 3), BG, dtype=np.uint8)
     cv2.line(d, (0, 0), (total_w, 0), OUTLINE, 1)
 
-    # ── 상태 배지 ──
     fill = (52, 130, 52) if running else (46, 46, 140)
     edge = GREEN if running else RED
     cv2.rectangle(d, (14, 14), (124, 56), fill, -1)
@@ -115,24 +108,23 @@ def _dashboard(total_w, running, steer, err, found, lost, fps, pwm, offset,
     _text(d, label, (14 + (110 - tw) // 2, 44), 0.8, (255, 255, 255), 2)
     _text(d, f"PWM {pwm}", (20, 82), 0.45, DIM)
 
-    # ── 조향/오차 바 (화면 오른쪽 = 실제 오른쪽) ──
     bx = 150
-    bw = max(120, total_w - bx - 122)   # 오른쪽 값 텍스트 공간 확보
-    _bar(d, bx, 24, bw, 20, steer, "STEER", flip=True)   # 조향 +는 왼쪽
+    bw = max(120, total_w - bx - 122)
+    _bar(d, bx, 24, bw, 20, steer, "STEER", flip=True)
     if err is not None:
-        _bar(d, bx, 68, bw, 20, err, "ERROR")            # 오차 +는 오른쪽
+        _bar(d, bx, 68, bw, 20, err, "ERROR")
     else:
         _text(d, f"LANE LOST ({lost})", (bx, 82), 0.55, RED, 2)
 
-    # ── 하단 정보 라인 ──
     cv2.line(d, (0, 98), (total_w, 98), OUTLINE, 1)
     lost_c = RED if lost > 5 else AMBER if lost > 0 else TXT
-    items = [("FPS", f"{fps:.0f}", TXT, 14), ("BANDS", str(found), TXT, 110),
-             ("LOST", str(lost), lost_c, 215),
-             ("OFS", f"{offset:+d}px", TXT, 315)]
+    calib_c = GREEN if calib_mode == "AUTO" else AMBER
+    items = [("FPS", f"{fps:.0f}", TXT, 14), ("BANDS", str(found), TXT, 100),
+             ("LOST", str(lost), lost_c, 195),
+             ("CALIB", calib_mode, calib_c, 280)]
     for k, v, c, x in items:
         _text(d, k, (x, 120), 0.42, DIM)
-        _text(d, v, (x + 46, 120), 0.42, c)
+        _text(d, v, (x + 50, 120), 0.42, c)
     if tune:
         _text(d, "TUNE MODE (t)", (total_w - 175, 120), 0.5, AMBER, 2)
 
@@ -142,24 +134,22 @@ def _dashboard(total_w, running, steer, err, found, lost, fps, pwm, offset,
 
 
 def _settings_panel(cfg):
-    """Settings 창 하단: 현재 적용값 실시간 표시"""
-    w, h = 480, 136
+    """Settings 창 하단: 현재 적용값 실시간 표시 (IPM은 자동이라 여기 없음)"""
+    w, h = 480, 118
     p = np.full((h, w, 3), BG, dtype=np.uint8)
     _text(p, "Drag sliders  |  w: save -> calib.json", (10, 20), 0.42, DIM)
     cv2.line(p, (0, 28), (w, 28), OUTLINE, 1)
-    _text(p, f"IPM   TL {cfg.get('ipm_tl_x', 0):+.2f},{cfg.get('ipm_tl_y', 0):.2f}"
-             f"   TR {cfg.get('ipm_tr_x', 0):+.2f},{cfg.get('ipm_tr_y', 0):.2f}",
+    _text(p, f"AUTO-CAL  VP margin {cfg.get('auto_calib_vp_margin', 0.14):.2f}"
+             f"   smooth a={cfg.get('auto_calib_alpha', 0.15):.2f}"
+             f"   min_px {int(cfg.get('auto_calib_min_px', 150))}",
           (10, 50), 0.42)
-    _text(p, f"      BL {cfg.get('ipm_bl_x', 0):+.2f},{cfg.get('ipm_bl_y', 0):.2f}"
-             f"   BR {cfg.get('ipm_br_x', 0):+.2f},{cfg.get('ipm_br_y', 0):.2f}",
-          (10, 70), 0.42)
     _text(p, f"CTRL  Kp {cfg.get('kp', 0):.1f}   Kd {cfg.get('kd', 0):.1f}"
              f"   RGain {cfg.get('steer_right_gain', 1.0):.1f}"
              f"   HGain {cfg.get('heading_gain', 0.5):.1f}"
              f"   Ctr {int(cfg.get('center_offset', 0)):+d}px",
-          (10, 94), 0.42)
+          (10, 72), 0.42)
     _text(p, f"DRIVE PWM {int(cfg.get('drive_pwm', 0))}"
-             f"   Bands {int(cfg.get('n_bands', 5))}", (10, 118), 0.42)
+             f"   Bands {int(cfg.get('n_bands', 5))}", (10, 96), 0.42)
     return p
 
 
@@ -172,8 +162,6 @@ def main():
     if "--cam" in sys.argv:
         cfg["cam_index"] = int(sys.argv[sys.argv.index("--cam") + 1])
 
-    # ── --record : 주행 중 원본 프레임을 데이터셋용으로 저장 ──
-    # records/run_날짜시각/ 에 오버레이 없는 JPG + labels.csv(err,steer,pwm)
     record = "--record" in sys.argv
     rec_dir, rec_csv, rec_count = None, None, 0
     if record:
@@ -181,8 +169,7 @@ def main():
         os.makedirs(rec_dir, exist_ok=True)
         rec_csv = open(os.path.join(rec_dir, "labels.csv"), "w")
         rec_csv.write("file,err,steer,pwm\n")
-        print(f"[record] 저장 폴더: {rec_dir} "
-              f"(RUN 중에만, {int(cfg.get('record_every', 3))}프레임마다 1장)")
+        print(f"[record] 저장 폴더: {rec_dir}")
 
     cap = cv2.VideoCapture(int(cfg["cam_index"]), cv2.CAP_AVFOUNDATION)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(cfg["frame_w"]))
@@ -191,38 +178,22 @@ def main():
         print("카메라 열기 실패. cam_index 확인")
         return
 
-    # 렌즈 왜곡 보정기 (시작 시 remap맵 1회 생성; 파일 없으면 pass-through)
-    und = Undistorter(cfg.get("camera_id", cfg["cam_index"]),
-                      int(cfg["frame_w"]), int(cfg["frame_h"]), INTRINSIC_DIR,
-                      enabled=bool(cfg.get("undistort", 1)))
-
-    det = ModelLaneDetector(cfg)   # 모델 경로는 lane_model.py 기본값(자기 폴더 기준) 사용
+    det = ModelLaneDetector(cfg)
     ctrl = LaneFollowController(kp=cfg["kp"], kd=cfg.get("kd", 6.0),
                                 steer_sign=cfg["steer_sign"],
                                 right_gain=cfg.get("steer_right_gain", 1.3))
     link = MegaLink(cfg, dry_run=dry)
 
-    # ── Settings 트랙바 창 ──
+    # ── Settings 트랙바 창 (IPM 트랙바 없음 — 자동 계산됨) ──
     SW = "Settings"
     cv2.namedWindow(SW, cv2.WINDOW_AUTOSIZE)
     nop = lambda v: None
-    # ── IPM 사다리꼴 네 모서리 (x는 +100 오프셋: 0~300 → -100%~200%) ──
-    cv2.createTrackbar("TL x+100", SW,
-                       int(float(cfg.get("ipm_tl_x", 0.25)) * 100) + 100, 300, nop)
-    cv2.createTrackbar("TL y%",    SW,
-                       int(float(cfg.get("ipm_tl_y", 0.40)) * 100), 100, nop)
-    cv2.createTrackbar("TR x+100", SW,
-                       int(float(cfg.get("ipm_tr_x", 0.75)) * 100) + 100, 300, nop)
-    cv2.createTrackbar("TR y%",    SW,
-                       int(float(cfg.get("ipm_tr_y", 0.40)) * 100), 100, nop)
-    cv2.createTrackbar("BL x+100", SW,
-                       int(float(cfg.get("ipm_bl_x", -0.40)) * 100) + 100, 300, nop)
-    cv2.createTrackbar("BL y%",    SW,
-                       int(float(cfg.get("ipm_bl_y", 0.98)) * 100), 100, nop)
-    cv2.createTrackbar("BR x+100", SW,
-                       int(float(cfg.get("ipm_br_x", 1.40)) * 100) + 100, 300, nop)
-    cv2.createTrackbar("BR y%",    SW,
-                       int(float(cfg.get("ipm_br_y", 0.98)) * 100), 100, nop)
+    cv2.createTrackbar("VPmargin x100", SW,
+                       int(float(cfg.get("auto_calib_vp_margin", 0.14)) * 100),
+                       50, nop)
+    cv2.createTrackbar("Smooth x100",   SW,
+                       int(float(cfg.get("auto_calib_alpha", 0.15)) * 100),
+                       100, nop)
     cv2.createTrackbar("Center+100", SW,
                        int(cfg.get("center_offset", 0)) + 100, 200, nop)
     cv2.createTrackbar("Bands",      SW,
@@ -237,38 +208,29 @@ def main():
                        int(float(cfg.get("heading_gain", 0.5)) * 10), 30, nop)
     cv2.createTrackbar("Drive PWM",  SW,
                        int(cfg.get("drive_pwm", 70)), 255, nop)
-    cv2.createTrackbar("LaneW px",   SW,
-                       int(cfg.get("bev_lane_width", 384)), 640, nop)
 
     cv2.imshow(SW, _settings_panel(cfg))
 
     running = False
     show_debug = True
-    tune_mode = False   # 't': 추론 일시정지 + 마지막 마스크 재사용 (트랙바 반응속도 ↑)
+    tune_mode = False
     last_steer = 0.0
-    cur_pwm = 0.0       # 현재 출력 PWM (정지 시 램프 감속용)
     lost_frames = 0
     t0, frames = time.time(), 0
     VW, VH = 640, 360
 
-    print(f"[main_model] cam={cfg['cam_index']} 준비 완료!")
+    print(f"[main_model-autocal] cam={cfg['cam_index']} 준비 완료!")
     try:
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
-            frame = und(frame)   # 렌즈 왜곡 보정 (비활성 시 원본 그대로)
 
-            # ── 트랙바에서 설정 읽기 ──
             try:
-                for key, bar in (("ipm_tl_x", "TL x+100"),
-                                 ("ipm_tr_x", "TR x+100"),
-                                 ("ipm_bl_x", "BL x+100"),
-                                 ("ipm_br_x", "BR x+100")):
-                    cfg[key] = (cv2.getTrackbarPos(bar, SW) - 100) / 100.0
-                for key, bar in (("ipm_tl_y", "TL y%"), ("ipm_tr_y", "TR y%"),
-                                 ("ipm_bl_y", "BL y%"), ("ipm_br_y", "BR y%")):
-                    cfg[key] = cv2.getTrackbarPos(bar, SW) / 100.0
+                cfg["auto_calib_vp_margin"] = cv2.getTrackbarPos(
+                    "VPmargin x100", SW) / 100.0
+                cfg["auto_calib_alpha"] = max(0.01, cv2.getTrackbarPos(
+                    "Smooth x100", SW) / 100.0)
                 cfg["center_offset"] = cv2.getTrackbarPos(
                     "Center+100", SW) - 100
                 cfg["n_bands"] = max(2, cv2.getTrackbarPos("Bands", SW))
@@ -284,17 +246,13 @@ def main():
                 cfg["heading_gain"] = cv2.getTrackbarPos("HGain x10", SW) / 10.0
                 cfg["drive_pwm"] = max(0, cv2.getTrackbarPos(
                     "Drive PWM", SW))
-                cfg["bev_lane_width"] = max(1, cv2.getTrackbarPos(
-                    "LaneW px", SW))
             except cv2.error:
                 pass
             det.cfg = cfg
 
-            # ── 차선 검출 (튠 모드에선 추론 생략, 마지막 마스크 재사용) ──
             err, found, dbg_orig, dbg_bev = det.process(
                 frame, reuse_masks=tune_mode)
 
-            # ── 조향 결정 ──
             if err is not None:
                 steer = ctrl.compute(err)
                 last_steer = steer
@@ -306,29 +264,18 @@ def main():
                 else:
                     steer = last_steer * 0.5
 
-            # ── 구동 명령 (일반 정지는 램프 감속, 비상/로스트 정지는 즉시) ──
-            if running and lost_frames <= cfg["lost_stop_frames"]:
-                target_pwm = int(cfg["drive_pwm"])
-                if abs(steer) > cfg["slow_steer_thresh"]:
-                    target_pwm = int(cfg["slow_pwm"])
-            else:
-                target_pwm = 0
-                if running:          # 로스트 초과 정지는 안전상 즉시
-                    cur_pwm = 0.0
-
-            ramp = float(cfg.get("brake_ramp_pwm", 6))
-            if target_pwm < cur_pwm:
-                cur_pwm = max(target_pwm, cur_pwm - ramp)  # 서서히 감속
-            else:
-                cur_pwm = float(target_pwm)                # 가속/유지는 즉시
-
-            pwm = int(round(cur_pwm))
-            if pwm > 0:
-                link.send_drive(pwm, steer)  # 감속 중에도 조향은 계속 유지
+            pwm = 0
+            if running:
+                if lost_frames > cfg["lost_stop_frames"]:
+                    link.send_brake()
+                else:
+                    pwm = int(cfg["drive_pwm"])
+                    if abs(steer) > cfg["slow_steer_thresh"]:
+                        pwm = int(cfg["slow_pwm"])
+                    link.send_drive(pwm, steer)
             else:
                 link.send_brake()
 
-            # ── 데이터셋 녹화 (RUN 중에만, N프레임마다 원본 저장) ──
             if record and running and \
                     frames % max(1, int(cfg.get("record_every", 3))) == 0:
                 fn = f"f{frames:06d}.jpg"
@@ -338,35 +285,32 @@ def main():
                               f"{round(steer, 4)},{pwm}\n")
                 rec_count += 1
 
-            # ── 비상정지 ──
             if _ESTOP["stop"]:
                 _ESTOP["stop"] = False
                 running = False
-                cur_pwm = 0.0        # 비상정지는 램프 없이 즉시
                 link.send_brake()
                 print("[estop] 비상정지!")
             if _ESTOP["quit"]:
                 break
 
-            # ── 디스플레이 ──
             frames += 1
             if show_debug:
                 fps = frames / max(1e-3, time.time() - t0)
 
-                # 이미 640x360이면 resize 생략 (프레임당 몇 ms 절약)
                 v_orig = dbg_orig if dbg_orig.shape[1::-1] == (VW, VH) \
                     else cv2.resize(dbg_orig, (VW, VH))
                 v_bev = dbg_bev if dbg_bev.shape[1::-1] == (VW, VH) \
                     else cv2.resize(dbg_bev, (VW, VH))
 
                 _title(v_orig, "CAMERA + MASK")
-                _title(v_bev, "BIRD'S EYE VIEW")
+                _title(v_bev, "BIRD'S EYE VIEW (auto-cal)")
 
-                views = np.vstack((v_orig, v_bev))   # 카메라 위, BEV 아래
+                views = np.vstack((v_orig, v_bev))
                 dash = _dashboard(
                     VW, running, steer, err, found,
                     lost_frames, fps, pwm,
-                    int(cfg.get("center_offset", 0)), tune=tune_mode)
+                    int(cfg.get("center_offset", 0)),
+                    calib_mode=det.calib_mode, tune=tune_mode)
                 display = np.vstack((views, dash))
                 if record and running:
                     cv2.circle(display, (VW - 96, 16), 7, RED, -1)
@@ -374,11 +318,9 @@ def main():
                           (VW - 82, 21), 0.5, RED, 2)
                 cv2.imshow("AI Lane", display)
 
-            # Settings 창 현재값 패널 (3프레임마다 갱신)
             if frames % 3 == 0:
                 cv2.imshow(SW, _settings_panel(cfg))
 
-            # ── 키 입력 ──
             k = cv2.waitKey(1) & 0xFF
             if k == ord('q'):
                 break
@@ -397,8 +339,7 @@ def main():
                 tune_mode = not tune_mode
                 if tune_mode:
                     running = False
-                    cur_pwm = 0.0
-                    link.send_brake()   # 튜닝 중 주행 금지 (오래된 마스크)
+                    link.send_brake()
                 print(f"[main_model] TUNE {'ON (추론 정지)' if tune_mode else 'OFF'}")
             elif k == ord('w'):
                 save(cfg)

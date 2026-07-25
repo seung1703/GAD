@@ -31,9 +31,10 @@ except ImportError:
 
 CLS_DASH, CLS_LANE, CLS_SOLID = 0, 1, 2
 
-# 디버그 색 (BGR): dash=주황, solid=파랑
+# 디버그 색 (BGR): dash=주황, solid=파랑, target=밝은초록(눈에 잘 띄게)
 COLOR_DASH = (0, 165, 255)
 COLOR_SOLID = (255, 80, 0)
+COLOR_TARGET = (0, 255, 0)      # 차가 향하는 목표(밴드 점 + line_x 세로선)
 
 # 실행 위치(CWD)와 무관하게 항상 dl_model/model/ 을 가리키도록 이 파일 기준 경로 사용
 DEFAULT_MODEL_PATH = os.path.join(
@@ -56,6 +57,7 @@ class ModelLaneDetector:
         self.prev_left_x = None
         self.prev_right_x = None
         self.prev_width = None
+        self.prev_near_off = 0.0   # 비대칭 룩어헤드용: 직전 프레임 횡오프셋(px)
         # 한쪽 선을 연속으로 못 본 프레임 수 → 임계 초과 시 그쪽 추적 리셋
         # (리셋해야 "중앙 기준 최근접" 초기 탐색이 다시 발동해 재획득 가능)
         self.miss_left = 0
@@ -130,6 +132,16 @@ class ModelLaneDetector:
         br[1] = max(br[1], tr[1] + 10)
         src = np.float32([tl, tr, bl, br])
 
+        # ── ROI 크롭: 사다리꼴(=자홍 박스) 밖 검출은 버린다 ──
+        # 추론은 화면 전체에서 돌고 warpPerspective도 전체를 변환하므로, 크롭이
+        # 없으면 박스 밖(배경/옆 트랙)의 선도 BEV로 매핑돼 밴드 스캔을 오염시킴.
+        # 워핑 전에 마스크를 사다리꼴로 잘라 "박스 안"만 남긴다.
+        roi_poly = np.int32(src[[0, 1, 3, 2]])       # tl, tr, br, bl 순 링
+        roi_mask = np.zeros((H, W), dtype=np.uint8)
+        cv2.fillConvexPoly(roi_mask, roi_poly, 255)
+        dash_mask = cv2.bitwise_and(dash_mask, roi_mask)
+        solid_mask = cv2.bitwise_and(solid_mask, roi_mask)
+
         # ── 원본 뷰 디버그: 클래스별 색 오버레이 ──
         dbg = frame_bgr.copy()
         ov = np.zeros_like(dbg)
@@ -154,6 +166,10 @@ class ModelLaneDetector:
         w_solid = cv2.warpPerspective(solid_mask, M, (W, H),
                                       flags=cv2.INTER_NEAREST)
         warped_dbg = cv2.warpPerspective(frame_bgr, M, (W, H))
+        # BEV 배경도 ROI(사다리꼴) 밖은 어둡게 → 밴드 스캔이 실제 쓰는 영역만 밝게.
+        # (검출 마스크는 이미 ROI로 잘렸고, 여기선 배경 그림만 시각적으로 일치시킴)
+        w_roi = cv2.warpPerspective(roi_mask, M, (W, H), flags=cv2.INTER_NEAREST)
+        warped_dbg[w_roi == 0] = (warped_dbg[w_roi == 0] * 0.25).astype(np.uint8)
         ovw = np.zeros_like(warped_dbg)
         ovw[w_dash == 255] = COLOR_DASH
         ovw[w_solid == 255] = COLOR_SOLID
@@ -169,9 +185,15 @@ class ModelLaneDetector:
         # 프레임 간 추적: 이전 프레임 값에서 시작 (없으면 화면 기준 초기화)
         left_x = self.prev_left_x
         right_x = self.prev_right_x
-        lane_w = self.prev_width if self.prev_width else int(W * 0.6)
+        # 단일 차선 offset에 쓸 "고정" 차로폭(BEV px). 라이브 측정 폭(cx_R-cx_L)은
+        # 커브에서 팽창(가로거리=폭/cosθ), 프레임 가장자리 조각남에선 축소돼
+        # 양방향으로 불안정하므로, offset에는 이 고정값을 쓴다. (트랙바 LaneW px =
+        # 직선 양선 구간의 실측 수직 폭에 맞출 것). 라이브 측정은 표시/기록용만.
+        lane_w_fixed = int(self.cfg.get("bev_lane_width", int(W * 0.6)))
+        lane_w = self.prev_width if self.prev_width else lane_w_fixed
 
-        pts = []          # (cy, target_cx, conf)
+        # ── Pass 1: 각 밴드의 선 위치만 확정 (목표는 기울기 안 뒤 Pass 2에서) ──
+        bands = []        # (cy, cx_L, cx_R, lx, rx, kind)  kind: both/solid/dash/est
         found = 0         # 실검출 밴드 수
         bot_left = bot_right = None   # 최하단 유효 밴드의 좌/우 (다음 프레임 기준)
         bot_width = None              # 최하단 양선 밴드의 차로폭 (왜곡 최소)
@@ -217,26 +239,22 @@ class ModelLaneDetector:
                     lane_w = w
                     if bot_width is None:
                         bot_width = w        # 최하단 양선 밴드 폭만 저장
-                target = (cx_L + cx_R) / 2
-                conf = 1.0
+                kind = "both"
                 found += 1
             elif cx_R is not None:          # 실선만 (점선 끊긴 구간)
                 right_x = cx_R
-                left_x = cx_R - lane_w
-                target = cx_R - lane_w / 2
-                conf = 0.6                   # 한쪽 추정: 가중치 낮춤
+                left_x = cx_R - lane_w_fixed   # 팬텀 좌측(추적/추정용, 대략)
+                kind = "solid"
                 found += 1
             elif cx_L is not None:          # 점선만
                 left_x = cx_L
-                right_x = cx_L + lane_w
-                target = cx_L + lane_w / 2
-                conf = 0.6
+                right_x = cx_L + lane_w_fixed
+                kind = "dash"
                 found += 1
             else:
                 if left_x is None or right_x is None:
                     continue                # 아직 아무 기준 없음: 밴드 스킵
-                target = (left_x + right_x) / 2  # 추정 (found에 안 셈)
-                conf = 0.3
+                kind = "est"                # 추정 (found에 안 셈)
 
             if cx_L is not None:
                 left_real = True
@@ -245,12 +263,7 @@ class ModelLaneDetector:
             if bot_left is None:             # 첫(=최하단) 유효 밴드 기록
                 bot_left, bot_right = left_x, right_x
 
-            pts.append((cy, target, conf))
-            if cx_L is not None:
-                cv2.circle(warped_dbg, (int(cx_L), cy), 5, COLOR_DASH, -1)
-            if cx_R is not None:
-                cv2.circle(warped_dbg, (int(cx_R), cy), 5, COLOR_SOLID, -1)
-            cv2.circle(warped_dbg, (int(target), cy), 5, (0, 255, 255), -1)
+            bands.append((cy, cx_L, cx_R, left_x, right_x, kind))
 
         # ── 미검출 처리: 실검출 0밴드면 err=None (main lost 로직 발동) ──
         if found == 0:
@@ -259,6 +272,85 @@ class ModelLaneDetector:
             cv2.putText(warped_dbg, "NO LANE", (W // 2 - 70, H // 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
             return None, 0, dbg, warped_dbg
+
+        # ── 선 기울기 → cosθ 보정계수 (한쪽 선만 볼 때 커브 중앙 정확도) ──
+        # 수직 폭을 가로 offset으로 쓰면 실제로는 폭/cosθ 만큼 벌어져야 하므로
+        # (선이 기울수록 커짐), 각 선의 라이브 기울기 slope=dx/dy로 √(1+slope²)를
+        # 곱한다. 점 2개 미만이면 보정 없음(1.0). 급기울기 폭주 방지로 상한 1.8.
+        def _slope_factor(pts_xy):
+            if len(pts_xy) < 2:
+                return 1.0
+            ys = np.array([p[0] for p in pts_xy], dtype=float)
+            xs = np.array([p[1] for p in pts_xy], dtype=float)
+            if np.ptp(ys) < 1:
+                return 1.0
+            slope = float(np.polyfit(ys, xs, 1)[0])   # dx/dy
+            return float(min(1.8, np.sqrt(1.0 + slope * slope)))
+
+        dash_all = [(cy, cxl) for cy, cxl, cxr, _, _, _ in bands if cxl is not None]
+        solid_all = [(cy, cxr) for cy, cxl, cxr, _, _, _ in bands if cxr is not None]
+        f_dash = _slope_factor(dash_all)
+        f_solid = _slope_factor(solid_all)
+        half = lane_w_fixed / 2.0
+
+        # ── 각 선을 프레임 내에서 직선 피팅 → 끊긴 밴드의 위치를 "예측" ──
+        # 점선은 끊겨도 여러 밴드에서 잡히므로, 그 점들로 선을 그어 빈 밴드의
+        # 점선 위치를 채운다(실선도 동일). 그러면 한쪽만 실측돼도 실측+예측으로
+        # 중점을 잡을 수 있어(=가상 양선) 폭 상수에 의존하지 않는다.
+        # 점 2개 미만이면 피팅 불가(None) → 그 선은 폭 offset 폴백을 쓴다.
+        # 스팬 밖 cy는 끝값을 유지해 폭주(과한 외삽)를 막는다.
+        def _fit_line(pts_xy):
+            if len(pts_xy) < 2:
+                return None
+            ys = np.array([p[0] for p in pts_xy], dtype=float)
+            xs = np.array([p[1] for p in pts_xy], dtype=float)
+            ymin, ymax = float(ys.min()), float(ys.max())
+            if ymax - ymin < 1:
+                xm = float(xs.mean())
+                return lambda cy: xm
+            a, b = np.polyfit(ys, xs, 1)
+            def pred(cy, a=a, b=b, ymin=ymin, ymax=ymax):
+                cyc = ymin if cy < ymin else (ymax if cy > ymax else cy)
+                return a * cyc + b
+            return pred
+
+        dash_fit = _fit_line(dash_all)
+        solid_fit = _fit_line(solid_all)
+
+        # ── Pass 2: 목표 계산 (가상 양선 우선, 불가 시 폭 offset 폴백) + 그리기 ──
+        pts = []          # (cy, target_cx, conf)
+        for cy, cx_L, cx_R, lx, rx, kind in bands:
+            # 실측 우선, 없으면 그 선의 피팅으로 예측
+            d = cx_L if cx_L is not None else (dash_fit(cy) if dash_fit else None)
+            s = cx_R if cx_R is not None else (solid_fit(cy) if solid_fit else None)
+            if d is not None and s is not None and d < s:
+                target = (d + s) / 2                # 가상 양선: 폭 상수 불필요
+                if cx_L is not None and cx_R is not None:
+                    conf = 1.0                       # 둘 다 실측
+                elif cx_L is not None or cx_R is not None:
+                    conf = 0.85                      # 한쪽 실측 + 한쪽 예측
+                else:
+                    conf = 0.7                       # 둘 다 예측
+            elif cx_R is not None:                   # 실선만 + 점선 정보 없음
+                target = cx_R - half * f_solid       # 폭 offset(cosθ 보정) 폴백
+                conf = 0.6
+            elif cx_L is not None:                   # 점선만 + 실선 정보 없음
+                target = cx_L + half * f_dash
+                conf = 0.6
+            else:                                    # est: 팬텀 중점
+                target = (lx + rx) / 2
+                conf = 0.3
+            pts.append((cy, target, conf))
+            # 실측 점(꽉 찬 원) / 예측 점(작은 원)로 구분 표시
+            if cx_L is not None:
+                cv2.circle(warped_dbg, (int(cx_L), cy), 5, COLOR_DASH, -1)
+            elif d is not None:
+                cv2.circle(warped_dbg, (int(d), cy), 3, COLOR_DASH, 1)
+            if cx_R is not None:
+                cv2.circle(warped_dbg, (int(cx_R), cy), 5, COLOR_SOLID, -1)
+            elif s is not None:
+                cv2.circle(warped_dbg, (int(s), cy), 3, COLOR_SOLID, 1)
+            cv2.circle(warped_dbg, (int(target), cy), 7, COLOR_TARGET, -1)
 
         # 다음 프레임 추적 기준은 "차 바로 앞(최하단) 밴드" 값으로 저장.
         # (상단 밴드 값으로 저장하면 곡선에서 다음 프레임 하단 탐색이 어긋나
@@ -281,11 +373,26 @@ class ModelLaneDetector:
         # 여기에 5배 가중까지 주면 정확한 가까운 밴드들이 평균에서 묻혀서
         # 차가 보이는 차선 쪽으로 붙는 문제가 있었음.
         # conf: 양선 1.0(+룩어헤드) / 한쪽 추정 0.6 / 무검출 추정 0.3
+        #
+        # ── 비대칭 룩어헤드 (진입엔 풀, 탈출엔 축소) ──
+        # 룩어헤드는 먼(위쪽) 밴드를 크게 가중해 코너에 미리 진입하게 한다. 그런데
+        # 코너 탈출 국면엔 가까운 길은 이미 직선인데 먼 밴드엔 코너 꼬리가 남아,
+        # 목표선이 계속 코너 쪽으로 물려 오버슈트("탈출 관성")가 난다.
+        # 그래서: 가까운(하단) 밴드로 잰 "현재 횡오프셋"이 중앙 쪽으로 줄어드는
+        # 중이면(=복귀/탈출) 룩어헤드를 lookahead_exit_scale 배로 줄여 목표선이
+        # 가까운 직선을 빨리 따라가게 한다. 진입/직선/코너 유지 중엔 풀 룩어헤드.
         la_gain = float(self.cfg.get("lookahead_gain", 4.0))
+        la_exit = float(self.cfg.get("lookahead_exit_scale", 0.4))
+        near_t = [t for cy, t, cf in pts if cy >= H * 0.6]   # 하단(가까운) 밴드
+        cur_off = abs(sum(near_t) / len(near_t) - center_x) if near_t else 0.0
+        exiting = cur_off < self.prev_near_off - 1.0         # 1px↑ 중앙 복귀 중
+        self.prev_near_off = cur_off
+        eff_la = la_gain * (la_exit if exiting else 1.0)
+
         wsum, xsum = 0.0, 0.0
         for cy, cx, conf in pts:
             if conf >= 1.0:
-                wgt = 1.0 + ((H - cy) / H) * la_gain
+                wgt = 1.0 + ((H - cy) / H) * eff_la
             else:
                 wgt = conf
             wsum += wgt
@@ -334,12 +441,22 @@ class ModelLaneDetector:
                                  + heading_gain * heading, -1, 1))
 
         cv2.line(warped_dbg, (int(line_x), 0), (int(line_x), H),
-                 (0, 255, 255), 2)
+                 COLOR_TARGET, 3)
         cv2.line(warped_dbg, (center_x, 0), (center_x, H), (0, 200, 200), 2)
         cv2.putText(warped_dbg,
                     f"L=dash R=solid  bands {found}/{n}  "
-                    f"miss L{self.miss_left} R{self.miss_right}",
+                    f"miss L{self.miss_left} R{self.miss_right}  "
+                    f"LA={'EXIT' if exiting else 'full'}({eff_la:.1f})",
                     (8, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                     (0, 255, 255), 1)
+        # 측정 차로폭 표시 — 직선 양선 구간의 meas 값을 LaneW px(고정 offset)에
+        # 넣으면 점선만/실선만 두 구간 모두 중앙을 정확히 잡는다. 커브의 meas는
+        # 팽창하므로 무시하고 "직선에서의 최소 meas"를 기준으로.
+        meas_w = int(self.prev_width) if self.prev_width else 0
+        cv2.putText(warped_dbg,
+                    f"laneW meas={meas_w}(dir)  fixed={lane_w_fixed}  "
+                    f"cos-corr D{f_dash:.2f} S{f_solid:.2f}",
+                    (8, H - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (0, 255, 120), 1)
 
         return err_norm, found, dbg, warped_dbg

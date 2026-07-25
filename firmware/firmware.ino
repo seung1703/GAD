@@ -51,11 +51,15 @@ const int pwm_RR  = 10; // 파란색 (PWM)
 // ==========================================
 // 2. 조향 제어 상수 (방향별 중립 유격 보정, calib.json pot_* 와 일치)
 // ==========================================
-const int STEER_LEFT    = 825;  // 좌측 최대
-const int STEER_RIGHT   = 679;  // 우측 최대
-const int STEER_NEUTRAL = 751;  // 이론상 정중앙
+const int STEER_LEFT    = 825;  // 좌측 최대 (실측 풀락)
+const int STEER_RIGHT   = 679;  // 우측 최대 (실측 풀락)
+const int STEER_NEUTRAL = 744;  // 유격 중앙 = (N_L 765 + N_R 739)/2
 
-const int STEER_DEADBAND = 8;   // 오차 허용 범위 (좌우 대칭)
+const int STEER_DEADBAND = 13;  // 유격 폭(|765-739|=26)의 절반. 정지 허용구간
+                                // [739,765]가 유격 구간과 일치 → 유격 안에서
+                                // 헛돌지(hunting) 않음. 데드밴드가 유격보다
+                                // 작으면(예: 8) 컨트롤러가 유격 안을 영원히
+                                // 왕복해 "핸들 혼자 돎" 발생.
 const int MIN_SPEED = 100;      // 조향 모터 최소 PWM
                                 // (70은 무부하 한계선 — 주행 하중 실리면 풀락
                                 //  근처 고저항 구간에서 스톨해 덜 꺾이는 원인)
@@ -226,7 +230,7 @@ void updateSteering() {
   if (speed > MAX_SPEED) speed = MAX_SPEED;
   if (speed < MIN_SPEED) speed = MIN_SPEED;
 
-  // 우측(679) < 중립(751) < 좌측(825): error>0 = 왼쪽으로
+  // 우측(679) < 중립(752) < 좌측(825): error>0 = 왼쪽으로
   if (error > 0) {
     digitalWrite(int1_ST, HIGH);
     digitalWrite(int2_ST, LOW);
