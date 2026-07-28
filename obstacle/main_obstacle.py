@@ -22,6 +22,8 @@ main_obstacle.py -- 장애물+신호등 미션: 초음파 감지 → 차선변�
   python3 main_obstacle.py --steeronly # 조향 전용 테스트: 뒷바퀴 정지 상태로
                                        # 초음파/차선변경 기동이 조향으로만 재생됨
                                        # (차 거치대에 올려두고 손으로 센서 가려보기)
+  python3 main_obstacle.py --stoptest  # 테스트: 장애물 감지하면 차선변경 안 하고
+                                       # 그 자리에서 정지 (감지/정지 타이밍 확인용)
   python3 main_obstacle.py --cam 1
 
 키:
@@ -79,6 +81,10 @@ class ObstacleFSM:
         self.cfg = cfg
         self.state = self.KEEP
         self.lane = "outer"
+        self.stop_test = False    # --stoptest: 장애물 감지 시 기동 대신 그 자리 정지
+        self.step_mode = False    # --step: 상태 전환마다 멈추고 스페이스바로 진행
+        self.pending = None       # 스텝 모드에서 승인 대기 중인 다음 상태
+        self._step_go = False     # step_advance()가 전환 1회를 허가하는 플래그
         self.t_state = time.time()
         self.front_hits = 0
         self.side_seen = False
@@ -107,8 +113,23 @@ class ObstacleFSM:
         return False
 
     def _start(self, state):
+        # 스텝 모드: 전환 요청을 가로채 대기(pending)에 두고, 스페이스바
+        # (step_advance)가 허가할 때만 실제로 진입한다.
+        if self.step_mode and not self._step_go:
+            self.pending = state
+            return
+        self._step_go = False
+        self.pending = None
         self.state = state
         self.t_state = time.time()
+
+    def step_advance(self):
+        """스페이스바 호출: 대기 중이던 다음 상태로 실제 진입. 대기 없으면 False."""
+        if self.pending is not None:
+            self._step_go = True
+            self._start(self.pending)
+            return True
+        return False
 
     def update(self, now, us, lane_est=None, heading=None):
         """매 프레임 호출. lane_est/heading = 비전 판정 (조건 기반 기동 전환용).
@@ -122,6 +143,9 @@ class ObstacleFSM:
         c = self.cfg
         self.front_cm = self._min_dist(us, c.get("us_front_ids", [0, 1]))
         self.side_cm = self._min_dist(us, c.get("us_right_ids", [2]))
+        # 스텝 모드에서 다음 상태가 대기 중이면: 정지하고 스페이스바를 기다린다.
+        if self.step_mode and self.pending is not None:
+            return 0.0, 0, None
         el = now - self.t_state
         mag = float(c.get("change_steer", 0.75))
         t_min = float(c.get("change_t_min", 0.3))
@@ -138,6 +162,9 @@ class ObstacleFSM:
                         self.front_hits = 0
                     if self.front_hits >= int(c.get("obs_trigger_hits", 3)):
                         self.front_hits = 0
+                        if self.stop_test:
+                            # 테스트 모드: 차선변경 안 하고 그 자리에서 정지 신호
+                            return 0.0, 0, "STOP"
                         self._start(self.CHG_PRE)
             else:   # inner: 복귀 시점 판단
                 past_min = now - self.t_inner > float(c.get("min_inner_s", 1.2))
@@ -254,7 +281,7 @@ def _title(img, text):
 
 
 def _dashboard(total_w, running, steer, err, lost, fps, pwm, fsm, tune=False,
-               steer_only=False):
+               steer_only=False, stop_test=False):
     H = 168
     d = np.full((H, total_w, 3), BG, dtype=np.uint8)
     cv2.line(d, (0, 0), (total_w, 0), OUTLINE, 1)
@@ -278,12 +305,16 @@ def _dashboard(total_w, running, steer, err, lost, fps, pwm, fsm, tune=False,
 
     # ── 미션 상태 라인 ──
     cv2.line(d, (0, 98), (total_w, 98), OUTLINE, 1)
-    st_c = GREEN if fsm.state == fsm.KEEP else AMBER
+    # 스텝 모드에서 다음 상태 대기 중이면 STATE 자리에 "WAIT->다음" 강조
+    if getattr(fsm, "pending", None) is not None:
+        st_val, st_c = f"WAIT>{fsm.pending}", AMBER
+    else:
+        st_val, st_c = fsm.state, (GREEN if fsm.state == fsm.KEEP else AMBER)
     lane_c = TXT if fsm.lane == "outer" else AMBER
     f_cm = "--" if fsm.front_cm is None else str(fsm.front_cm)
     s_cm = "--" if fsm.side_cm is None else str(fsm.side_cm)
     f_c = RED if (fsm.front_cm or 999) < 50 else TXT
-    items = [("STATE", fsm.state, st_c, 14), ("LANE", fsm.lane, lane_c, 155),
+    items = [("STATE", st_val, st_c, 14), ("LANE", fsm.lane, lane_c, 155),
              ("FRONT", f_cm + "cm", f_c, 285), ("SIDE", s_cm + "cm", TXT, 420)]
     for k, v, c, x in items:
         _text(d, k, (x, 120), 0.42, DIM)
@@ -297,6 +328,8 @@ def _dashboard(total_w, running, steer, err, lost, fps, pwm, fsm, tune=False,
         _text(d, "TUNE (t)", (total_w - 110, 150), 0.45, AMBER, 2)
     if steer_only:
         _text(d, "STEER-ONLY", (total_w - 250, 150), 0.45, AMBER, 2)
+    if stop_test:
+        _text(d, "STOP-TEST", (total_w - 360, 150), 0.45, RED, 2)
     _text(d, "s go  x stop  o change  p return  w save  q quit",
           (14, 164), 0.38, DIM)
     return d
@@ -327,6 +360,8 @@ def _settings_panel(cfg):
 def main():
     dry = "--dry" in sys.argv
     steer_only = "--steeronly" in sys.argv
+    stop_test = "--stoptest" in sys.argv   # 장애물 감지 시 기동 대신 그 자리 정지
+    step_mode = "--step" in sys.argv       # 상태 전환마다 멈추고 스페이스바로 진행
     cfg = load()
 
     if "--cam" in sys.argv:
@@ -349,6 +384,8 @@ def main():
                                 right_gain=cfg.get("steer_right_gain", 1.0))
     link = MegaLink(cfg, dry_run=dry)
     fsm = ObstacleFSM(cfg)
+    fsm.stop_test = stop_test
+    fsm.step_mode = step_mode
 
     # ── Settings 트랙바 ──
     SW = "Settings"
@@ -390,6 +427,12 @@ def main():
           f"(o/p 키로 차선변경 수동 트리거)")
     if steer_only:
         print("[obstacle] ★ STEER-ONLY 모드: 뒷바퀴 정지, 조향만 동작 ★")
+    if stop_test:
+        print("[obstacle] ★ STOP-TEST 모드: 장애물 감지하면 차선변경 없이 "
+              "그 자리 정지 ★")
+    if step_mode:
+        print("[obstacle] ★ STEP 모드: 상태 전환마다 멈춤. "
+              "스페이스바로 다음 단계 진행 (정지는 x) ★")
     try:
         while True:
             ok, frame = cap.read()
@@ -443,7 +486,14 @@ def main():
                 steer_ov, pwm_ov, lane_changed = fsm.update(
                     time.time(), us,
                     lane_est=det.lane_est, heading=det.last_heading)
-            if lane_changed:
+            if lane_changed == "STOP":
+                # --stoptest: 장애물 감지 지점에서 정지 (기동 안 함)
+                running = False
+                cur_pwm = 0.0
+                link.send_brake()
+                print("[obstacle] ★ 장애물 감지 — 그 자리 정지 (stoptest). "
+                      "'s'로 재시작 ★")
+            elif lane_changed:
                 print(f"[obstacle] 기동 완료 -> {lane_changed} "
                       f"(비전 플립+헤딩 수렴 확인됨)")
 
@@ -541,7 +591,7 @@ def main():
                 views = np.vstack((v_orig, v_bev))
                 dash = _dashboard(VW, running, steer, err, lost_frames,
                                   fps, pwm, fsm, tune=tune_mode,
-                                  steer_only=steer_only)
+                                  steer_only=steer_only, stop_test=stop_test)
                 display = np.vstack((views, dash))
                 cv2.imshow("Obstacle Mission", display)
 
@@ -556,7 +606,16 @@ def main():
                 running = True
                 t0, frames = time.time(), 0
                 print("[obstacle] GO")
-            elif k in (ord('x'), ord(' ')):
+            elif k == ord(' '):
+                # 스텝 모드 + 대기 중이면 다음 상태로 진행, 아니면 정지
+                if step_mode and fsm.pending is not None:
+                    nxt = fsm.pending
+                    fsm.step_advance()
+                    print(f"[step] 진행 -> {nxt}")
+                else:
+                    running = False
+                    print("[obstacle] STOP")
+            elif k == ord('x'):
                 running = False
                 print("[obstacle] STOP")
             elif k == ord('o'):
