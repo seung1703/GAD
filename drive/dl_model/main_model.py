@@ -199,7 +199,7 @@ def main():
     det = ModelLaneDetector(cfg)   # 모델 경로는 lane_model.py 기본값(자기 폴더 기준) 사용
     ctrl = LaneFollowController(kp=cfg["kp"], kd=cfg.get("kd", 6.0),
                                 steer_sign=cfg["steer_sign"],
-                                right_gain=cfg.get("steer_right_gain", 1.3))
+                                right_gain=cfg.get("steer_right_gain", 1.0))
     link = MegaLink(cfg, dry_run=dry)
 
     # ── Settings 트랙바 창 ──
@@ -232,7 +232,7 @@ def main():
     cv2.createTrackbar("Kd x10",     SW,
                        int(float(cfg.get("kd", 6.0)) * 10), 300, nop)
     cv2.createTrackbar("RGain x10",  SW,
-                       int(float(cfg.get("steer_right_gain", 1.3)) * 10), 30, nop)
+                       int(float(cfg.get("steer_right_gain", 1.0)) * 10), 30, nop)
     cv2.createTrackbar("HGain x10",  SW,
                        int(float(cfg.get("heading_gain", 0.5)) * 10), 30, nop)
     cv2.createTrackbar("Drive PWM",  SW,

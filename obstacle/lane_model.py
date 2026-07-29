@@ -244,9 +244,14 @@ class ModelLaneDetector:
             h_s = np.sum(w_solid[by0:by1, :], axis=0)
 
             def _cls(x):
-                """경계 x 주변 ±12px에서 dash/solid 픽셀 다수결"""
+                """경계 x 주변 ±12px에서 dash/solid 픽셀 다수결.
+                한쪽이 뚜렷하게 우세할 때만 판정, 애매하면 None(불확실)."""
                 a, z = int(max(0, x - 12)), int(min(W, x + 12))
-                return "solid" if h_s[a:z].sum() > h_d[a:z].sum() else "dash"
+                s_sum, d_sum = float(h_s[a:z].sum()), float(h_d[a:z].sum())
+                total = s_sum + d_sum
+                if total < 1 or abs(s_sum - d_sum) / total < 0.3:
+                    return None
+                return "solid" if s_sum > d_sum else "dash"
 
             # 오른쪽 경계: 이전 x 근처, 초기엔 중앙 오른쪽 최근접
             cx_R = None
@@ -274,15 +279,17 @@ class ModelLaneDetector:
 
             cls_L = _cls(cx_L) if cx_L is not None else None
             cls_R = _cls(cx_R) if cx_R is not None else None
-            if bot_cls_L is None and cls_L is not None:
-                bot_cls_L = cls_L
-            if bot_cls_R is None and cls_R is not None:
-                bot_cls_R = cls_R
 
             # 좌우가 뒤집히면(교차) 신뢰 불가 → 이 밴드 버림
             if cx_L is not None and cx_R is not None and cx_L >= cx_R:
                 cx_L = cx_R = None
                 cls_L = cls_R = None
+
+            # lane_est용 클래스 확정은 교차 무효화 이후 값으로만 (오염 방지)
+            if bot_cls_L is None and cls_L is not None:
+                bot_cls_L = cls_L
+            if bot_cls_R is None and cls_R is not None:
+                bot_cls_R = cls_R
 
             if cx_L is not None and cx_R is not None:
                 left_x, right_x = cx_L, cx_R

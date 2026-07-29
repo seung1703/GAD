@@ -70,10 +70,8 @@ except ImportError:
 
 class ObstacleFSM:
     KEEP = "KEEP"
-    CHG_PRE = "CHG_PRE"       # 정지 상태로 바퀴 먼저 풀락 (조향모터 대기)
-    CHG_OUT = "CHG_OUT"       # 안쪽으로 꺾는 중
+    CHG_OUT = "CHG_OUT"       # 안쪽으로 꺾는 중 (감지 즉시 최대조향+전진)
     CHG_ALIGN = "CHG_ALIGN"   # 카운터 조향으로 정렬 중
-    RET_PRE = "RET_PRE"
     RET_OUT = "RET_OUT"       # 바깥으로 꺾는 중
     RET_ALIGN = "RET_ALIGN"
 
@@ -101,14 +99,14 @@ class ObstacleFSM:
     def force_change(self):
         """수동 트리거('o'): 바깥 KEEP에서 즉시 차선변경 시작"""
         if self.state == self.KEEP and self.lane == "outer":
-            self._start(self.CHG_PRE)
+            self._start(self.CHG_OUT)
             return True
         return False
 
     def force_return(self):
         """수동 트리거('p'): 안쪽 KEEP에서 즉시 복귀 시작"""
         if self.state == self.KEEP and self.lane == "inner":
-            self._start(self.RET_PRE)
+            self._start(self.RET_OUT)
             return True
         return False
 
@@ -131,14 +129,15 @@ class ObstacleFSM:
             return True
         return False
 
-    def update(self, now, us, lane_est=None, heading=None):
-        """매 프레임 호출. lane_est/heading = 비전 판정 (조건 기반 기동 전환용).
+    def update(self, now, us, heading=None):
+        """매 프레임 호출. heading = 비전 헤딩 추정 (정렬 종료 판단용).
         반환: (steer_override, pwm_override, lane_changed)
           steer_override None이면 평소 비전 주행, 값이 있으면 오픈루프 기동 중.
-        기동 단계 종료는 조건 기반:
-          꺾기(OUT)   종료 = 비전 차선 판정(lane_est)이 목표 차선으로 플립
-          정렬(ALIGN) 종료 = |헤딩| < align_heading_thresh (차선과 평행해짐)
-          각 단계 change_t_max 초과 시 타임아웃 폴백 (안전)
+        꺾기(OUT) 단계는 차가 대각선으로 움직여 좌/우 트래킹이 흔들리는
+        구간이라 차선 판정(lane_est)을 신뢰하지 않는다 — change_t_out
+        고정시간 오픈루프로만 진행. 비전 판정은 KEEP(직진 안정 구간)에서만
+        신뢰해 사용한다 (main 루프에서 fsm.lane 동기화).
+        정렬(ALIGN) 종료 = |헤딩| < align_heading_thresh, 초과 시 change_t_max 타임아웃 폴백.
         """
         c = self.cfg
         self.front_cm = self._min_dist(us, c.get("us_front_ids", [0, 1]))
@@ -148,7 +147,7 @@ class ObstacleFSM:
             return 0.0, 0, None
         el = now - self.t_state
         mag = float(c.get("change_steer", 0.75))
-        t_min = float(c.get("change_t_min", 0.3))
+        t_out = float(c.get("change_t_out", 1.0))
         t_max = float(c.get("change_t_max", 2.5))
         h_th = float(c.get("align_heading_thresh", 0.10))
 
@@ -165,7 +164,7 @@ class ObstacleFSM:
                         if self.stop_test:
                             # 테스트 모드: 차선변경 안 하고 그 자리에서 정지 신호
                             return 0.0, 0, "STOP"
-                        self._start(self.CHG_PRE)
+                        self._start(self.CHG_OUT)
             else:   # inner: 복귀 시점 판단
                 past_min = now - self.t_inner > float(c.get("min_inner_s", 1.2))
                 # 1) 우측 센서가 있으면: 장애물을 봤다가 사라진 것 확인 (우선)
@@ -183,19 +182,11 @@ class ObstacleFSM:
                 # 2) 우측 센서 없음(전방 2개 구성): 시간 기반 복귀
                 elif past_min and \
                         now - self.t_inner > float(c.get("inner_hold_s", 3.0)):
-                    self._start(self.RET_PRE)
+                    self._start(self.RET_OUT)
             return None, None, None
 
-        elif self.state == self.CHG_PRE:      # 정지+풀락 대기 (미리 확 꺾기)
-            if el > float(c.get("change_t_pre", 0.4)):
-                self._start(self.CHG_OUT)
-            return +mag, 0, None
-
-        elif self.state == self.CHG_OUT:      # 왼쪽(안쪽)으로 — 비전 플립까지
-            arrived = el > t_min and lane_est == "inner"
-            if arrived or el > t_max:
-                if not arrived:
-                    print("[fsm] CHG_OUT 타임아웃 — 비전 플립 미확인, 정렬 진행")
+        elif self.state == self.CHG_OUT:      # 왼쪽(안쪽)으로 — 고정시간 오픈루프
+            if el > t_out:
                 self._start(self.CHG_ALIGN)
             return +mag, int(c.get("change_pwm", 70)), None
 
@@ -211,16 +202,8 @@ class ObstacleFSM:
                 return None, None, "inner"
             return -mag * 0.8, int(c.get("change_pwm", 70)), None
 
-        elif self.state == self.RET_PRE:      # 정지+풀락 대기
-            if el > float(c.get("change_t_pre", 0.4)):
-                self._start(self.RET_OUT)
-            return -mag, 0, None
-
-        elif self.state == self.RET_OUT:      # 오른쪽(바깥)으로 — 비전 플립까지
-            arrived = el > t_min and lane_est == "outer"
-            if arrived or el > t_max:
-                if not arrived:
-                    print("[fsm] RET_OUT 타임아웃 — 비전 플립 미확인, 정렬 진행")
+        elif self.state == self.RET_OUT:      # 오른쪽(바깥)으로 — 고정시간 오픈루프
+            if el > t_out:
                 self._start(self.RET_ALIGN)
             return -mag, int(c.get("change_pwm", 70)), None
 
@@ -344,6 +327,7 @@ def _settings_panel(cfg):
              f"   clear {int(cfg.get('side_clear_cm', 65))}cm"
              f"   cooldown {cfg.get('cooldown_s', 1.5):.1f}s", (10, 50), 0.42)
     _text(p, f"CHG  steer {cfg.get('change_steer', 0.75):.2f}"
+             f"   t_out {cfg.get('change_t_out', 1.0):.1f}s"
              f"   t_max {cfg.get('change_t_max', 2.5):.1f}s"
              f"   alignTh {cfg.get('align_heading_thresh', 0.10):.2f}"
              f"   pwm {int(cfg.get('change_pwm', 70))}", (10, 72), 0.42)
@@ -395,6 +379,8 @@ def main():
                        int(cfg.get("obs_trigger_cm", 45)), 150, nop)
     cv2.createTrackbar("ChgSteer x100", SW,
                        int(float(cfg.get("change_steer", 0.75)) * 100), 100, nop)
+    cv2.createTrackbar("Tout x10", SW,
+                       int(float(cfg.get("change_t_out", 1.0)) * 10), 50, nop)
     cv2.createTrackbar("Tmax x10", SW,
                        int(float(cfg.get("change_t_max", 2.5)) * 10), 50, nop)
     cv2.createTrackbar("AlignTh x100", SW,
@@ -444,6 +430,8 @@ def main():
                 cfg["obs_trigger_cm"] = cv2.getTrackbarPos("ObsTrig cm", SW)
                 cfg["change_steer"] = max(10, cv2.getTrackbarPos(
                     "ChgSteer x100", SW)) / 100.0
+                cfg["change_t_out"] = max(5, cv2.getTrackbarPos(
+                    "Tout x10", SW)) / 10.0
                 cfg["change_t_max"] = max(5, cv2.getTrackbarPos(
                     "Tmax x10", SW)) / 10.0
                 cfg["align_heading_thresh"] = max(2, cv2.getTrackbarPos(
@@ -472,8 +460,8 @@ def main():
                 last_us_log = time.time()
                 if us:
                     pot_s = f"  pot:{link.pot}" if link.pot is not None else ""
-                    print("[us] " + "  ".join(
-                        f"U{i}:{us[i]}cm" for i in sorted(us)) + pot_s)
+                    #print("[us] " + "  ".join(
+                        #f"U{i}:{us[i]}cm" for i in sorted(us)) + pot_s)
                 elif not dry:
                     print("[us] 수신 없음 — 펌웨어 업로드/배선/포트 확인")
             # ── 차선 검출 먼저 (경계 클래스로 현재 차선 자동 판정) ──
@@ -484,8 +472,7 @@ def main():
             steer_ov, pwm_ov, lane_changed = (None, None, None)
             if running:   # 정지 중엔 상태머신 동결 (오발동 방지)
                 steer_ov, pwm_ov, lane_changed = fsm.update(
-                    time.time(), us,
-                    lane_est=det.lane_est, heading=det.last_heading)
+                    time.time(), us, heading=det.last_heading)
             if lane_changed == "STOP":
                 # --stoptest: 장애물 감지 지점에서 정지 (기동 안 함)
                 running = False
@@ -495,7 +482,7 @@ def main():
                       "'s'로 재시작 ★")
             elif lane_changed:
                 print(f"[obstacle] 기동 완료 -> {lane_changed} "
-                      f"(비전 플립+헤딩 수렴 확인됨)")
+                      f"(고정시간 꺾기 + 헤딩 수렴 확인됨)")
 
             # 비전 판정을 상태머신에 동기화 (KEEP 상태에서만 — 기동 중엔
             # 점선을 가로지르는 중이라 판정이 흔들리는 게 정상)

@@ -55,7 +55,7 @@ const int STEER_LEFT    = 825;  // 좌측 최대 (실측 풀락)
 const int STEER_RIGHT   = 679;  // 우측 최대 (실측 풀락)
 const int STEER_NEUTRAL = 744;  // 유격 중앙 = (N_L 765 + N_R 739)/2
 
-const int STEER_DEADBAND = 13;  // 유격 폭(|765-739|=26)의 절반. 정지 허용구간
+const int STEER_DEADBAND = 8;  // 유격 폭(|765-739|=26)의 절반. 정지 허용구간
                                 // [739,765]가 유격 구간과 일치 → 유격 안에서
                                 // 헛돌지(hunting) 않음. 데드밴드가 유격보다
                                 // 작으면(예: 8) 컨트롤러가 유격 안을 영원히
