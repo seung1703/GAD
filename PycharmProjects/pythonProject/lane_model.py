@@ -159,6 +159,14 @@ class ModelLaneDetector:
         ovw[w_solid == 255] = COLOR_SOLID
         warped_dbg = cv2.addWeighted(warped_dbg, 0.7, ovw, 0.5, 0)
 
+        # ── 차로 모드에 따라 좌/우 경계 클래스 결정 ──
+        # lane_mode 2 (바깥차로): 왼쪽=dash(중앙점선), 오른쪽=solid(바깥실선)
+        # lane_mode 1 (안쪽차로): 왼쪽=solid(안쪽실선), 오른쪽=dash(중앙점선)
+        if int(self.cfg.get("lane_mode", 2)) == 1:
+            w_left, w_right = w_solid, w_dash
+        else:
+            w_left, w_right = w_dash, w_solid
+
         # ── 밴드 스캔: 왼쪽=dash, 오른쪽=solid ──
         n = int(self.cfg["n_bands"])
         band_h = H // n
@@ -179,12 +187,12 @@ class ModelLaneDetector:
         for b in range(n - 1, -1, -1):   # 차 바로 앞(하단)부터
             by0, by1 = b * band_h, (b + 1) * band_h
             cy = (by0 + by1) // 2
-            h_dash = np.sum(w_dash[by0:by1, :], axis=0)
-            h_solid = np.sum(w_solid[by0:by1, :], axis=0)
+            h_left = np.sum(w_left[by0:by1, :], axis=0)
+            h_right = np.sum(w_right[by0:by1, :], axis=0)
 
             # solid(오른쪽 경계): 이전 x 근처, 초기엔 중앙 오른쪽 최근접
             cx_R = None
-            res = self._nearest_blob(h_solid, right_x, max_jump)
+            res = self._nearest_blob(h_right, right_x, max_jump)
             if res is not None:
                 cand, centers = res
                 if cand is not None:
@@ -196,7 +204,7 @@ class ModelLaneDetector:
 
             # dash(왼쪽 경계): 이전 x 근처, 초기엔 중앙 왼쪽 최근접
             cx_L = None
-            res = self._nearest_blob(h_dash, left_x, max_jump)
+            res = self._nearest_blob(h_left, left_x, max_jump)
             if res is not None:
                 cand, centers = res
                 if cand is not None:
@@ -336,8 +344,10 @@ class ModelLaneDetector:
         cv2.line(warped_dbg, (int(line_x), 0), (int(line_x), H),
                  (0, 255, 255), 2)
         cv2.line(warped_dbg, (center_x, 0), (center_x, H), (0, 200, 200), 2)
+        _mode = int(self.cfg.get("lane_mode", 2))
+        _lr = "L=solid R=dash" if _mode == 1 else "L=dash R=solid"
         cv2.putText(warped_dbg,
-                    f"L=dash R=solid  bands {found}/{n}  "
+                    f"[{_mode}차선] {_lr}  bands {found}/{n}  "
                     f"miss L{self.miss_left} R{self.miss_right}",
                     (8, H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                     (0, 255, 255), 1)

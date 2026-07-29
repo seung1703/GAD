@@ -29,12 +29,13 @@ class MegaLink:
         self.ser = None
         self._last_steer_cmd = None
         self._last_drive_cmd = None
-        self._heartbeat_s = 0.15
+        self._heartbeat_s = 0.3
         self._last_tx = 0.0
         if not self.dry:
             port = cfg["serial_port"]
-            self.ser = serial.Serial(port, int(cfg["baud"]), timeout=0)
-            time.sleep(2.0)            # Mega 리셋 대기
+            self.ser = serial.Serial(port, int(cfg["baud"]),
+                                     timeout=0.05, write_timeout=0.5)
+            time.sleep(2.0)  # Mega 리셋 대기
             print(f"[serial] connected {port}")
         else:
             print("[serial] DRY-RUN")
@@ -61,16 +62,29 @@ class MegaLink:
         sc = self._steer_cmd(steer_norm)
         dc = self._drive_cmd(drive_pwm)
         out = []
-        if sc != self._last_steer_cmd:
+
+        # 조향: 각도가 의미 있게(3 이상) 바뀔 때만 전송 → 시리얼 부하 감소
+        if self._last_steer_cmd is None:
+            send_steer = True
+        else:
+            try:
+                prev_angle = int(self._last_steer_cmd[1:])
+                new_angle = int(sc[1:])
+                send_steer = abs(new_angle - prev_angle) >= 3
+            except ValueError:
+                send_steer = True
+
+        if send_steer:
             out.append(sc)
             self._last_steer_cmd = sc
         if dc != self._last_drive_cmd:
             out.append(dc)
             self._last_drive_cmd = dc
+
         if out:
             self._write(out)
         elif time.time() - self._last_tx > self._heartbeat_s:
-            self._write([sc, dc])   # 워치독 하트비트
+            self._write([sc, dc])  # 워치독 하트비트
         return sc, dc
 
     def send_brake(self):
@@ -89,7 +103,48 @@ class MegaLink:
             print("[serial] write err:", e)
 
     def read_telemetry(self):
-        return None
+        """아두이노가 보낸 'U,fL,fC,fR,bL,bC,bR\n' 줄을 파싱해서 반환.
+           새 줄 없으면 None. 절대 블로킹되지 않도록 방어적으로 처리."""
+        if self.dry or not self.ser:
+            return None
+        if not hasattr(self, '_rx_buf'):
+            self._rx_buf = ""
+
+        try:
+            n = self.ser.in_waiting
+        except Exception:
+            return None
+        if n <= 0:
+            return None
+
+        n = min(n, 512)   # 한 번에 너무 많이 안 읽음 (안전 상한)
+        try:
+            data = self.ser.read(n)
+        except Exception:
+            return None
+        if not data:
+            return None
+
+        self._rx_buf += data.decode(errors="ignore")
+        # 버퍼가 비정상적으로 커지면 (파싱 안 되는 쓰레기 누적) 리셋
+        if len(self._rx_buf) > 4096:
+            self._rx_buf = ""
+            return None
+
+        result = None
+        while "\n" in self._rx_buf:
+            line, self._rx_buf = self._rx_buf.split("\n", 1)
+            line = line.strip()
+            if line.startswith("U,"):
+                parts = line.split(",")
+                if len(parts) == 7:
+                    try:
+                        fL, fC, fR, bL, bC, bR = map(int, parts[1:])
+                        result = {"fL": fL, "fC": fC, "fR": fR,
+                                 "bL": bL, "bC": bC, "bR": bR}
+                    except ValueError:
+                        pass
+        return result
 
     def close(self):
         if not self.dry and self.ser:

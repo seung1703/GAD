@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""
-main_model.py -- AI 모델 차선추종 + ROI 실시간 설정 + 대시보드
-                 (장애물 회피 로직 없음 -- 순수 차선 추종 전용, 2바퀴 미션용)
+"""main_model.py -- lane following + IPM tuning + dashboard
+   + lane 1/2 mode switch + ultrasonic front-center obstacle avoidance
 
-  카메라(별도 스레드) → YOLO 차선 검출 → P제어 → 시리얼(Mega)
+  camera(thread) -> YOLO lane detection -> P control -> serial(Mega)
 
-실행:
-  python3 main_model.py            # 실제 주행
-  python3 main_model.py --dry      # 시리얼 없이 비전만
-  python3 main_model.py --cam 1    # 카메라 지정
-  python3 main_model.py --record   # 주행하며 데이터셋 녹화
+run:
+  python3 main_model.py            # normal drive
+  python3 main_model.py --dry      # vision only, no serial
+  python3 main_model.py --cam 1    # choose camera index
+  python3 main_model.py --record   # record dataset while driving
 
-키:
-  s=출발  x/Space=정지  q=종료  w=설정저장  d=디버그토글
-  1=1차선 모드(L=solid R=dash)  2=2차선 모드(L=dash R=solid)
-  ESC=비상정지(전역)  F12=종료(전역)
+keys:
+  s=go  x/Space=stop  q=quit  w=save settings  d=toggle debug view
+  1=lane1 mode (L=solid R=dash)  2=lane2 mode (L=dash R=solid)
+  ESC=global emergency stop  F12=global quit
 """
 import os
 import sys
@@ -30,9 +29,8 @@ from control import LaneFollowController
 from serial_driver import MegaLink
 
 
-# ── 카메라 스레드 (버퍼 누적/블로킹 방지 + 자동 재연결) ──────────
+# ── camera thread (avoid buffer buildup / blocking, auto reconnect) ──
 class CameraThread:
-    """카메라를 별도 스레드에서 계속 읽어(drain) 버퍼 누적/블로킹 방지 + 자동 재연결"""
     def __init__(self, cam_index, w, h):
         self.cam_index = cam_index
         self.w, self.h = w, h
@@ -86,10 +84,12 @@ class CameraThread:
         self.cap.release()
 
 
-# ── 전역 비상정지 ──
+# ── global emergency stop ──
 try:
     from pynput import keyboard as _kb
+
     _ESTOP = {"stop": False, "quit": False}
+
 
     def _on_press(key):
         if key == _kb.Key.esc:
@@ -97,23 +97,23 @@ try:
         elif key == _kb.Key.f12:
             _ESTOP["quit"] = True
 
+
     _kb.Listener(on_press=_on_press, daemon=True).start()
     print("[estop] ESC=stop, F12=quit")
 except ImportError:
     _ESTOP = {"stop": False, "quit": False}
     print("[estop] pynput not installed")
 
-
-# ── UI 팔레트 (BGR) ──────────────────────────────────────────
+# ── UI palette (BGR) ──
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-BG      = (28, 26, 24)     # 배경
-PANEL   = (46, 42, 38)     # 바/패널
-OUTLINE = (70, 63, 57)     # 테두리
-TXT     = (232, 227, 220)  # 본문
-DIM     = (145, 137, 128)  # 보조 텍스트
-GREEN   = (105, 205, 95)
-AMBER   = (55, 175, 255)
-RED     = (80, 80, 245)
+BG = (28, 26, 24)
+PANEL = (46, 42, 38)
+OUTLINE = (70, 63, 57)
+TXT = (232, 227, 220)
+DIM = (145, 137, 128)
+GREEN = (105, 205, 95)
+AMBER = (55, 175, 255)
+RED = (80, 80, 245)
 
 
 def _text(img, s, xy, scale=0.45, color=TXT, thick=1):
@@ -121,7 +121,6 @@ def _text(img, s, xy, scale=0.45, color=TXT, thick=1):
 
 
 def _bar(img, x, y, w, h, val, label, flip=False):
-    """중앙 기준 수평 바 (-1~1). flip=True면 화면 방향=실제 진행 방향으로 뒤집음."""
     f = -val if flip else val
     cv2.rectangle(img, (x, y), (x + w, y + h), PANEL, -1)
     cv2.rectangle(img, (x, y), (x + w, y + h), OUTLINE, 1)
@@ -142,7 +141,6 @@ def _bar(img, x, y, w, h, val, label, flip=False):
 
 
 def _title(img, text):
-    """뷰 상단 반투명 타이틀 스트립"""
     ov = img.copy()
     cv2.rectangle(ov, (0, 0), (img.shape[1], 26), BG, -1)
     cv2.addWeighted(ov, 0.6, img, 0.4, 0, dst=img)
@@ -150,33 +148,39 @@ def _title(img, text):
 
 
 def _dashboard(total_w, running, steer, err, found, lost, fps, pwm, offset,
-               tune=False, lane_mode=2):
-    """상태 대시보드 (세로 배치용 컴팩트 레이아웃, 폭 640 기준)"""
+               tune=False, obstacle=False, obstacle_cm=None, lane_mode=2,
+               avoiding=False):
     H = 146
     d = np.full((H, total_w, 3), BG, dtype=np.uint8)
     cv2.line(d, (0, 0), (total_w, 0), OUTLINE, 1)
 
-    # ── 상태 배지 ──
-    if running:
+    if avoiding:
+        fill, edge, label = (55, 120, 200), AMBER, "AVOID"
+    elif obstacle:
+        fill, edge, label = (46, 46, 140), RED, "STOP"
+    elif running:
         fill, edge, label = (52, 130, 52), GREEN, "RUN"
     else:
         fill, edge, label = (46, 46, 140), RED, "STOP"
     cv2.rectangle(d, (14, 14), (124, 56), fill, -1)
     cv2.rectangle(d, (14, 14), (124, 56), edge, 1)
-    (tw, _), _ = cv2.getTextSize(label, FONT, 0.8, 2)
-    _text(d, label, (14 + (110 - tw) // 2, 44), 0.8, (255, 255, 255), 2)
+    (tw, _), _ = cv2.getTextSize(label, FONT, 0.7, 2)
+    _text(d, label, (14 + (110 - tw) // 2, 44), 0.7, (255, 255, 255), 2)
     _text(d, f"PWM {pwm}  [lane {lane_mode}]", (20, 82), 0.42, DIM)
 
-    # ── 조향/오차 바 (화면 오른쪽 = 실제 오른쪽) ──
     bx = 150
-    bw = max(120, total_w - bx - 122)   # 오른쪽 값 텍스트 공간 확보
-    _bar(d, bx, 24, bw, 20, steer, "STEER", flip=True)   # 조향 +는 왼쪽
+    bw = max(120, total_w - bx - 122)
+    _bar(d, bx, 24, bw, 20, steer, "STEER", flip=True)
     if err is not None:
-        _bar(d, bx, 68, bw, 20, err, "ERROR")            # 오차 +는 오른쪽
+        _bar(d, bx, 68, bw, 20, err, "ERROR")
     else:
         _text(d, f"LANE LOST ({lost})", (bx, 82), 0.55, RED, 2)
 
-    # ── 하단 정보 라인 ──
+    if avoiding:
+        _text(d, "LANE CHANGE IN PROGRESS", (bx, 82), 0.5, AMBER, 2)
+    elif obstacle:
+        _text(d, f"OBSTACLE {obstacle_cm}cm", (bx, 82), 0.55, RED, 2)
+
     cv2.line(d, (0, 98), (total_w, 98), OUTLINE, 1)
     lost_c = RED if lost > 5 else AMBER if lost > 0 else TXT
     items = [("FPS", f"{fps:.0f}", TXT, 14), ("BANDS", str(found), TXT, 110),
@@ -193,8 +197,7 @@ def _dashboard(total_w, running, steer, err, found, lost, fps, pwm, offset,
     return d
 
 
-def _settings_panel(cfg, lane_mode=2):
-    """Settings 창 하단: 현재 적용값 실시간 표시"""
+def _settings_panel(cfg, lane_mode=2, avoid_state="normal"):
     w, h = 480, 150
     p = np.full((h, w, 3), BG, dtype=np.uint8)
     _text(p, "Drag sliders  |  w: save -> calib.json", (10, 20), 0.42, DIM)
@@ -212,11 +215,10 @@ def _settings_panel(cfg, lane_mode=2):
           (10, 94), 0.42)
     _text(p, f"DRIVE PWM {int(cfg.get('drive_pwm', 0))}"
              f"   Bands {int(cfg.get('n_bands', 5))}", (10, 118), 0.42)
-    _text(p, f"LANE MODE: {lane_mode}", (10, 140), 0.42, AMBER)
+    _text(p, f"LANE MODE: {lane_mode}   AVOID: {avoid_state}",
+          (10, 140), 0.42, AMBER)
     return p
 
-
-# ── 메인 ──────────────────────────────────────────────────────
 
 def main():
     dry = "--dry" in sys.argv
@@ -225,7 +227,6 @@ def main():
     if "--cam" in sys.argv:
         cfg["cam_index"] = int(sys.argv[sys.argv.index("--cam") + 1])
 
-    # ── --record : 주행 중 원본 프레임을 데이터셋용으로 저장 ──
     record = "--record" in sys.argv
     rec_dir, rec_csv, rec_count = None, None, 0
     if record:
@@ -236,74 +237,83 @@ def main():
         print(f"[record] output folder: {rec_dir} "
               f"(only while RUN, 1 frame per {int(cfg.get('record_every', 3))})")
 
-    # ── 카메라: 별도 스레드로 열기 (버퍼 누적/블로킹 방지) ──
     cap = CameraThread(int(cfg["cam_index"]),
                        int(cfg["frame_w"]), int(cfg["frame_h"]))
     if not cap.isOpened():
         print("camera open failed. check cam_index")
         return
 
-    det = ModelLaneDetector(cfg)   # 모델 경로는 lane_model.py 기본값(자기 폴더 기준) 사용
+    det = ModelLaneDetector(cfg)
     ctrl = LaneFollowController(kp=cfg["kp"], kd=cfg.get("kd", 6.0),
                                 steer_sign=cfg["steer_sign"],
                                 right_gain=cfg.get("steer_right_gain", 1.3))
     link = MegaLink(cfg, dry_run=dry)
 
     if "lane_mode" not in cfg:
-        cfg["lane_mode"] = 2   # 기본: 2차선(바깥차로)에서 출발
+        cfg["lane_mode"] = 2
 
-    # ── Settings 트랙바 창 ──
     SW = "Settings"
     cv2.namedWindow(SW, cv2.WINDOW_AUTOSIZE)
     nop = lambda v: None
-    # ── IPM 사다리꼴 네 모서리 (x는 +100 오프셋: 0~300 → -100%~200%) ──
     cv2.createTrackbar("TL x+100", SW,
                        int(float(cfg.get("ipm_tl_x", 0.25)) * 100) + 100, 300, nop)
-    cv2.createTrackbar("TL y%",    SW,
+    cv2.createTrackbar("TL y%", SW,
                        int(float(cfg.get("ipm_tl_y", 0.40)) * 100), 100, nop)
     cv2.createTrackbar("TR x+100", SW,
                        int(float(cfg.get("ipm_tr_x", 0.75)) * 100) + 100, 300, nop)
-    cv2.createTrackbar("TR y%",    SW,
+    cv2.createTrackbar("TR y%", SW,
                        int(float(cfg.get("ipm_tr_y", 0.40)) * 100), 100, nop)
     cv2.createTrackbar("BL x+100", SW,
                        int(float(cfg.get("ipm_bl_x", -0.40)) * 100) + 100, 300, nop)
-    cv2.createTrackbar("BL y%",    SW,
+    cv2.createTrackbar("BL y%", SW,
                        int(float(cfg.get("ipm_bl_y", 0.98)) * 100), 100, nop)
     cv2.createTrackbar("BR x+100", SW,
                        int(float(cfg.get("ipm_br_x", 1.40)) * 100) + 100, 300, nop)
-    cv2.createTrackbar("BR y%",    SW,
+    cv2.createTrackbar("BR y%", SW,
                        int(float(cfg.get("ipm_br_y", 0.98)) * 100), 100, nop)
     cv2.createTrackbar("Center+100", SW,
                        int(cfg.get("center_offset", 0)) + 100, 200, nop)
-    cv2.createTrackbar("Bands",      SW,
+    cv2.createTrackbar("Bands", SW,
                        int(cfg.get("n_bands", 5)), 10, nop)
-    cv2.createTrackbar("Kp x10",     SW,
+    cv2.createTrackbar("Kp x10", SW,
                        int(float(cfg.get("kp", 1.4)) * 10), 50, nop)
-    cv2.createTrackbar("Kd x10",     SW,
+    cv2.createTrackbar("Kd x10", SW,
                        int(float(cfg.get("kd", 6.0)) * 10), 300, nop)
-    cv2.createTrackbar("RGain x10",  SW,
+    cv2.createTrackbar("RGain x10", SW,
                        int(float(cfg.get("steer_right_gain", 1.3)) * 10), 30, nop)
-    cv2.createTrackbar("HGain x10",  SW,
+    cv2.createTrackbar("HGain x10", SW,
                        int(float(cfg.get("heading_gain", 0.5)) * 10), 30, nop)
-    cv2.createTrackbar("Drive PWM",  SW,
+    cv2.createTrackbar("Drive PWM", SW,
                        int(cfg.get("drive_pwm", 70)), 255, nop)
 
-    cv2.imshow(SW, _settings_panel(cfg, cfg["lane_mode"]))
+    cv2.imshow(SW, _settings_panel(cfg, cfg["lane_mode"], "normal"))
 
     running = False
     show_debug = True
-    tune_mode = False   # 't': 추론 일시정지 + 마지막 마스크 재사용 (트랙바 반응속도 ↑)
+    tune_mode = False
     last_steer = 0.0
     lost_frames = 0
     t0, frames = time.time(), 0
     VW, VH = 640, 360
 
-    print(f"[main_model] cam={cfg['cam_index']} ready! (lane_mode={cfg['lane_mode']})")
+    # ── obstacle avoidance settings ──
+    OBSTACLE_CM = 100  # front-center distance threshold (cm)
+    last_tele = None
+
+    LANE_CHANGE_FRAMES = 60  # forced-steer duration during lane change
+    LANE_CHANGE_STEER = 0.8  # forced steer magnitude (-1..1)
+    AVOID_COOLDOWN_FRAMES = 60  # frames to ignore re-detection after a change
+    avoid_state = "normal"  # "normal" | "changing"
+    avoid_dir = 0.0
+    avoid_target_mode = None
+    avoid_frame_count = 0
+    avoid_cooldown = 0
+
+    print(f"[main_model] cam={cfg['cam_index']} ready! (start lane_mode={cfg['lane_mode']})")
     try:
         while True:
             ok, frame = cap.read()
             if not ok or frame is None:
-                # 프레임 못 받아도 루프는 계속 돌아서 키 입력/브레이크 유지
                 if running:
                     link.send_brake()
                 k = cv2.waitKey(10) & 0xFF
@@ -311,7 +321,6 @@ def main():
                     break
                 continue
 
-            # ── 트랙바에서 설정 읽기 ──
             try:
                 for key, bar in (("ipm_tl_x", "TL x+100"),
                                  ("ipm_tr_x", "TR x+100"),
@@ -340,12 +349,52 @@ def main():
                 pass
             det.cfg = cfg
 
-            # ── 차선 검출 (튠 모드에선 추론 생략, 마지막 마스크 재사용) ──
             err, found, dbg_orig, dbg_bev = det.process(
                 frame, reuse_masks=tune_mode)
 
-            # ── 조향 결정 ──
-            if err is not None:
+            # ── ultrasonic telemetry: front-center sensor only ──
+            tele = link.read_telemetry()
+            if tele:
+                last_tele = tele
+            front_blocked = False
+            front_min = None
+            if last_tele:
+                front_min = last_tele["fC"]
+                front_blocked = front_min < OBSTACLE_CM
+
+            # ── avoidance state machine ──
+            # steer toward the side where solid line is NOT:
+            #   lane 2 (R=solid) -> steer left ; lane 1 (L=solid) -> steer right
+            if avoid_state == "normal":
+                if avoid_cooldown > 0:
+                    avoid_cooldown -= 1
+                elif front_blocked and running:
+                    cur_mode = int(cfg.get("lane_mode", 2))
+                    if cur_mode == 2:
+                        avoid_dir, avoid_target_mode = 1.0, 1
+                    else:
+                        avoid_dir, avoid_target_mode = -1.0, 2
+                    avoid_state = "changing"
+                    avoid_frame_count = 0
+                    print(f"[avoid] front {front_min}cm detected -> "
+                          f"changing to lane {avoid_target_mode}")
+            elif avoid_state == "changing":
+                avoid_frame_count += 1
+                if avoid_frame_count >= LANE_CHANGE_FRAMES:
+                    cfg["lane_mode"] = avoid_target_mode
+                    det.prev_left_x = det.prev_right_x = None
+                    det.miss_left = det.miss_right = 0
+                    ctrl.prev_err = None
+                    ctrl.d_filt = 0.0
+                    avoid_state = "normal"
+                    avoid_cooldown = AVOID_COOLDOWN_FRAMES
+                    print(f"[avoid] lane change to {avoid_target_mode} complete")
+
+            # ── steering decision ──
+            if avoid_state == "changing":
+                steer = avoid_dir * LANE_CHANGE_STEER
+                last_steer = steer
+            elif err is not None:
                 steer = ctrl.compute(err)
                 last_steer = steer
                 lost_frames = 0
@@ -356,10 +405,13 @@ def main():
                 else:
                     steer = last_steer * 0.5
 
-            # ── 구동 명령 ──
+            # ── drive command ──
             pwm = 0
             if running:
-                if lost_frames > cfg["lost_stop_frames"]:
+                if avoid_state == "changing":
+                    pwm = int(cfg["slow_pwm"])
+                    link.send_drive(pwm, steer)
+                elif lost_frames > cfg["lost_stop_frames"]:
                     link.send_brake()
                 else:
                     pwm = int(cfg["drive_pwm"])
@@ -369,7 +421,6 @@ def main():
             else:
                 link.send_brake()
 
-            # ── 데이터셋 녹화 (RUN 중에만, N프레임마다 원본 저장) ──
             if record and running and \
                     frames % max(1, int(cfg.get("record_every", 3))) == 0:
                 fn = f"f{frames:06d}.jpg"
@@ -379,7 +430,6 @@ def main():
                               f"{round(steer, 4)},{pwm}\n")
                 rec_count += 1
 
-            # ── 비상정지 ──
             if _ESTOP["stop"]:
                 _ESTOP["stop"] = False
                 running = False
@@ -388,12 +438,10 @@ def main():
             if _ESTOP["quit"]:
                 break
 
-            # ── 디스플레이 ──
             frames += 1
             if show_debug:
                 fps = frames / max(1e-3, time.time() - t0)
 
-                # 이미 640x360이면 resize 생략 (프레임당 몇 ms 절약)
                 v_orig = dbg_orig if dbg_orig.shape[1::-1] == (VW, VH) \
                     else cv2.resize(dbg_orig, (VW, VH))
                 v_bev = dbg_bev if dbg_bev.shape[1::-1] == (VW, VH) \
@@ -402,12 +450,14 @@ def main():
                 _title(v_orig, "CAMERA + MASK")
                 _title(v_bev, "BIRD'S EYE VIEW")
 
-                views = np.vstack((v_orig, v_bev))   # 카메라 위, BEV 아래
+                views = np.vstack((v_orig, v_bev))
                 dash = _dashboard(
                     VW, running, steer, err, found,
                     lost_frames, fps, pwm,
                     int(cfg.get("center_offset", 0)), tune=tune_mode,
-                    lane_mode=int(cfg.get("lane_mode", 2)))
+                    obstacle=front_blocked, obstacle_cm=front_min,
+                    lane_mode=int(cfg.get("lane_mode", 2)),
+                    avoiding=(avoid_state == "changing"))
                 display = np.vstack((views, dash))
                 if record and running:
                     cv2.circle(display, (VW - 96, 16), 7, RED, -1)
@@ -415,13 +465,10 @@ def main():
                           (VW - 82, 21), 0.5, RED, 2)
                 cv2.imshow("AI Lane", display)
 
-            # ── 초음파 텔레메트리 읽기 (전방 장애물 감지, 3프레임마다만) ──
             if frames % 3 == 0:
-                tele = link.read_telemetry()
-                if tele:
-                    last_tele = tele
+                cv2.imshow(SW, _settings_panel(
+                    cfg, int(cfg.get("lane_mode", 2)), avoid_state))
 
-            # ── 키 입력 ──
             k = cv2.waitKey(1) & 0xFF
             if k == ord('q'):
                 break
@@ -440,7 +487,7 @@ def main():
                 tune_mode = not tune_mode
                 if tune_mode:
                     running = False
-                    link.send_brake()   # 튜닝 중 주행 금지 (오래된 마스크)
+                    link.send_brake()
                 print(f"[main_model] TUNE {'ON (inference paused)' if tune_mode else 'OFF'}")
             elif k == ord('w'):
                 save(cfg)
