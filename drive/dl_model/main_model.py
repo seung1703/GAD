@@ -90,6 +90,33 @@ def _bar(img, x, y, w, h, val, label, flip=False):
     _text(img, f"{val:+.2f}  {arrow}", (x + w + 10, y + h - 5), 0.5, TXT)
 
 
+# ── 방향키 미세조정 ────────────────────────────────────────────
+# 위/아래로 트랙바를 고르고, 좌/우로 1스텝씩 움직인다. 1스텝은 트랙바
+# 해상도 그대로라 IPM은 0.01, Center는 1px, 게인은 0.1 단위가 된다.
+# 순서 = 튜닝하는 순서(ROI 먼저).
+TUNE_BARS = ["TL x+100", "TL y%", "TR x+100", "TR y%",
+             "BL x+100", "BL y%", "BR x+100", "BR y%",
+             "Center+100", "Bands", "Kp x10", "Kd x10",
+             "RGain x10", "HGain x10", "Drive PWM", "LaneW px"]
+
+# 방향키 코드는 OS/백엔드마다 다르다 (waitKeyEx 원값: macOS, GTK, Windows).
+# ★ & 0xFF 로 마스킹하면 안 된다 — GTK의 Left(65361)가 'q'(113)와 겹쳐서
+#   왼쪽 방향키를 누르는 순간 프로그램이 종료된다.
+_ARROW_UP    = (63232, 65362, 2490368)
+_ARROW_DOWN  = (63233, 65364, 2621440)
+_ARROW_LEFT  = (63234, 65361, 2424832)
+_ARROW_RIGHT = (63235, 65363, 2555904)
+
+
+def _nudge_bar(win, bar, delta):
+    """선택된 트랙바를 delta(±1)만큼 이동. 상한은 OpenCV가 알아서 자른다."""
+    try:
+        cv2.setTrackbarPos(bar, win,
+                           max(0, cv2.getTrackbarPos(bar, win) + delta))
+    except cv2.error:
+        pass
+
+
 def _title(img, text):
     """뷰 상단 반투명 타이틀 스트립"""
     ov = img.copy()
@@ -141,11 +168,12 @@ def _dashboard(total_w, running, steer, err, found, lost, fps, pwm, offset,
     return d
 
 
-def _settings_panel(cfg):
-    """Settings 창 하단: 현재 적용값 실시간 표시"""
-    w, h = 480, 136
+def _settings_panel(cfg, sel_bar=None, win=None):
+    """Settings 창 하단: 현재 적용값 + 방향키로 선택 중인 트랙바 표시"""
+    w, h = 480, 160
     p = np.full((h, w, 3), BG, dtype=np.uint8)
-    _text(p, "Drag sliders  |  w: save -> calib.json", (10, 20), 0.42, DIM)
+    _text(p, "Sliders or arrow keys  |  w: save -> calib.json",
+          (10, 20), 0.42, DIM)
     cv2.line(p, (0, 28), (w, 28), OUTLINE, 1)
     _text(p, f"IPM   TL {cfg.get('ipm_tl_x', 0):+.2f},{cfg.get('ipm_tl_y', 0):.2f}"
              f"   TR {cfg.get('ipm_tr_x', 0):+.2f},{cfg.get('ipm_tr_y', 0):.2f}",
@@ -160,6 +188,24 @@ def _settings_panel(cfg):
           (10, 94), 0.42)
     _text(p, f"DRIVE PWM {int(cfg.get('drive_pwm', 0))}"
              f"   Bands {int(cfg.get('n_bands', 5))}", (10, 118), 0.42)
+
+    # ── 방향키 선택 항목 ──
+    cv2.line(p, (0, 128), (w, 128), OUTLINE, 1)
+    if sel_bar is None:
+        _text(p, "^ v pick bar   < > step +-1   (or n/m , .)",
+              (10, 148), 0.4, DIM)
+    else:
+        name = TUNE_BARS[sel_bar]
+        pos = ""
+        if win is not None:
+            try:
+                pos = f" = {cv2.getTrackbarPos(name, win)}"
+            except cv2.error:
+                pass
+        _text(p, "SEL", (10, 148), 0.42, DIM)
+        _text(p, f"{name}{pos}", (46, 148), 0.45, AMBER, 1)
+        _text(p, f"[{sel_bar + 1}/{len(TUNE_BARS)}]  ^v pick  <> +-1",
+              (250, 148), 0.4, DIM)
     return p
 
 
@@ -240,7 +286,8 @@ def main():
     cv2.createTrackbar("LaneW px",   SW,
                        int(cfg.get("bev_lane_width", 384)), 640, nop)
 
-    cv2.imshow(SW, _settings_panel(cfg))
+    sel_bar = 0          # 방향키로 선택 중인 트랙바 인덱스
+    cv2.imshow(SW, _settings_panel(cfg, sel_bar, SW))
 
     running = False
     show_debug = True
@@ -376,11 +423,24 @@ def main():
 
             # Settings 창 현재값 패널 (3프레임마다 갱신)
             if frames % 3 == 0:
-                cv2.imshow(SW, _settings_panel(cfg))
+                cv2.imshow(SW, _settings_panel(cfg, sel_bar, SW))
 
             # ── 키 입력 ──
-            k = cv2.waitKey(1) & 0xFF
-            if k == ord('q'):
+            # 방향키를 받으려면 waitKeyEx 원값이 필요하다. 방향키 판정을
+            # 반드시 먼저 하고, 그 뒤에만 & 0xFF 로 ASCII 키를 본다.
+            kx = cv2.waitKeyEx(1)
+            k = kx & 0xFF
+
+            # 방향키(또는 대체키 n/m , .): 트랙바 선택 + 1스텝 미세조정
+            if kx in _ARROW_UP or k == ord('n'):
+                sel_bar = (sel_bar - 1) % len(TUNE_BARS)
+            elif kx in _ARROW_DOWN or k == ord('m'):
+                sel_bar = (sel_bar + 1) % len(TUNE_BARS)
+            elif kx in _ARROW_LEFT or k == ord(','):
+                _nudge_bar(SW, TUNE_BARS[sel_bar], -1)
+            elif kx in _ARROW_RIGHT or k == ord('.'):
+                _nudge_bar(SW, TUNE_BARS[sel_bar], +1)
+            elif k == ord('q'):
                 break
             elif k == ord('s'):
                 running = True
