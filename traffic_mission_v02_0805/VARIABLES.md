@@ -1,0 +1,212 @@
+# traffic_mission_v02_0805 변수 설명
+
+실제 설정 파일은 `shared/calib.json`입니다. Ctrl+F로 변수 이름을 검색할 수 있도록 코드의 키 이름을 제목과 표에 그대로 적었습니다.
+
+## [카메라]
+
+| 변수 | 기본값 | 의미와 조정 효과 |
+|---|---:|---|
+| `cam_index` | `0` | 차선 카메라 인덱스입니다. Windows 카메라 번호가 바뀌면 수정합니다. |
+| `traffic_cam_index` | `3` | 신호등과 자동차를 함께 보는 통합 카메라 인덱스입니다. |
+| `camera_id` | `3` | `camera_intrinsic`에서 차선 카메라 보정 파일을 찾을 때 사용하는 ID입니다. |
+| `frame_w`, `frame_h` | `640`, `360` | 차선 카메라 요청 해상도입니다. 16:9 비율을 유지합니다. |
+| `traffic_frame_w`, `traffic_frame_h` | `640`, `360` | 통합 카메라 요청 해상도입니다. 전체 프레임 모델 입력의 원본 해상도입니다. |
+| `camera_backend` | `CAP_DSHOW` | Windows DirectShow 백엔드입니다. Windows에서는 그대로 사용하는 것을 권장합니다. |
+| `camera_fps` | `30` | 카메라 요청 FPS입니다. 실제 FPS는 장치 지원값에 따라 다르며 시작 로그에 표시됩니다. |
+| `camera_fourcc` | `MJPG` | 고해상도 30 FPS를 받기 위한 카메라 코덱 요청입니다. |
+| `camera_buffer_size` | `1` | OpenCV 캡처 버퍼 크기입니다. 작을수록 오래된 프레임 누적을 줄입니다. |
+| `undistort` | `1` | 차선 처리에 왜곡 보정을 적용합니다. 통합 카메라와 원본 녹화에는 적용하지 않습니다. |
+
+## [통합 모델]
+
+| 변수 | 기본값 | 의미와 조정 효과 |
+|---|---:|---|
+| `combined_image_size` | `640` | `best_11n.pt` 입력 크기입니다. 높이면 작은 신호등/차량 검출에 유리할 수 있지만 추론이 느려집니다. |
+| `combined_inference_interval_s` | `0.04` | 통합 추론 완료 후 다음 추론까지 최소 간격입니다. 낮추면 더 자주 시도하지만 CPU가 이미 가득 차면 효과가 없습니다. |
+| `traffic_confidence` | `0.25` | `red/green` accepted 기준입니다. 높이면 오검출은 줄고 먼 신호등 누락은 늘 수 있습니다. |
+| `traffic_result_stale_s` | `0.5` | 신호 결과 최대 사용 나이입니다. 너무 작으면 느린 PC에서 `unknown`이 잦아집니다. |
+| `car_confidence` | `0.6` | `stroller` 자동차 accepted 기준입니다. 0.46 검출은 회피에 쓰지 않습니다. |
+| `car_min_area_ratio` | `0.01` | 자동차 박스 면적/전체 프레임 면적 최솟값입니다. 높이면 먼 작은 차를 무시합니다. |
+| `car_class_names` | `["stroller"]` | 자동차 장애물로 취급할 클래스 목록입니다. 현재 모델의 차 클래스 이름과 같아야 합니다. |
+| `car_result_stale_s` | `0.8` | 자동차 결과 최대 사용 나이입니다. 오래된 차 박스로 회피하지 않도록 제한합니다. |
+| `car_model_required` | `1` | 통합 모델 파이프라인이 고장 나면 안전 정지할지 결정합니다. 실제 주행에서는 `1`을 유지합니다. |
+| `combined_pipeline_timeout_s` | `2.0` | 새 통합 추론 결과가 이 시간보다 오래 없으면 파이프라인 이상으로 판단합니다. |
+| `combined_startup_grace_s` | `5.0` | 모델 로딩 직후 첫 결과를 기다리는 유예 시간입니다. |
+| `model_device` | `cpu` | YOLO 실행 장치입니다. CUDA 환경을 검증하지 않았다면 `cpu`를 유지합니다. |
+| `model_cpu_threads` | `6` | PyTorch CPU 연산 스레드 수입니다. 무조건 높인다고 빨라지지 않습니다. |
+| `model_cpu_interop_threads` | `2` | PyTorch 연산 간 병렬 스레드 수입니다. |
+
+## [자동차 ROI]
+
+신호등 ROI는 없으며 `red/green`은 전체 화면에서 사용합니다. 아래 변수는 `stroller`의 회피 후보 판정에만 적용되고 모델은 계속 전체 프레임을 한 번 추론합니다.
+
+| 변수 | 현재값 | 의미와 조정 효과 |
+|---|---:|---|
+| `car_roi_left` | `0.15` | 자동차 ROI 왼쪽 경계입니다. 높이면 화면 왼쪽 자동차를 더 많이 제외합니다. |
+| `car_roi_top` | `0.15` | 자동차 ROI 위쪽 경계입니다. 높이면 먼 위쪽 자동차가 늦게 후보가 됩니다. |
+| `car_roi_right` | `0.85` | 자동차 ROI 오른쪽 경계입니다. 낮추면 화면 오른쪽 자동차를 더 많이 제외합니다. |
+| `car_roi_bottom` | `1.0` | 자동차 ROI 아래쪽 경계입니다. 일반적으로 `1.0`을 유지합니다. |
+
+좌표는 전체 통합 프레임의 비율이며 `0.15`는 가로 또는 세로 크기의 15% 지점입니다. 박스가 ROI와 겹치는지만 보지 않고 자동차가 도로에 닿는 지점을 근사한 **박스 아래쪽 중앙점**이 ROI 안에 있는지 검사합니다. `Lane ROI / Drive Controls`에서 실시간 조절하고 `w`로 저장합니다.
+
+## [신호등 확정]
+
+| 변수 | 기본값 | 의미와 조정 효과 |
+|---|---:|---|
+| `lane_confirm_count` | `2` | crosswalk를 연속 확인해야 하는 새 검출 결과 수입니다. 높이면 오정지는 줄지만 정지가 늦어집니다. |
+| `stop_signal_confirm_count` | `1` | `red`를 연속 확인해야 하는 횟수입니다. 높이면 오정지는 줄지만 정지가 늦어집니다. |
+| `go_signal_confirm_count` | `1` | 정지 상태에서 `green`을 연속 확인해야 하는 횟수입니다. 높이면 오출발은 줄지만 출발이 늦어집니다. |
+| `video_stop_after_signal_resume_s` | `3.0` | green 출발 확정 후 모든 AVI를 닫기까지 기다리는 시간입니다. |
+
+프레임 수는 카메라 원시 프레임 수가 아니라 서로 다른 새 통합 추론 결과 수 기준입니다. 예를 들어 추론이 8 FPS이고 확인 횟수가 3이면 최솟값만 계산해도 약 0.375초가 필요합니다.
+
+## [차선 모델]
+
+| 변수 | 기본값 | 의미와 조정 효과 |
+|---|---:|---|
+| `model_imgsz` | `320` | `lane_best.pt` 입력 크기입니다. 높이면 차선 마스크가 정교해질 수 있지만 FPS가 낮아집니다. |
+| `model_conf` | `0.4` | 차선 분할 confidence 기준입니다. |
+| `model_mask_threshold` | `0.5` | 분할 mask 이진화 기준입니다. 높이면 mask가 얇아지고 낮추면 넓어집니다. |
+| `mask_close_kernel` | `0` | mask 끊김을 잇는 closing 커널 크기입니다. `0`은 비활성입니다. |
+| `n_bands` | `7` | BEV 세로 밴드 수입니다. 높이면 곡선 형태를 더 많이 샘플링하지만 잡음 영향도 늘 수 있습니다. |
+| `reacquire_frames` | `8` | 회피/신호 미션 뒤 차선 추적값을 다시 안정화하는 프레임 수입니다. |
+| `boundary_class_min_pixels` | `2` | 경계의 dash/solid 클래스를 판정할 최소 픽셀 수입니다. |
+| `boundary_class_ratio` | `1.1` | dash와 solid 픽셀 수 우세 비율입니다. 높이면 애매한 경계가 분류되지 않을 수 있습니다. |
+| `mask_roi_margin_x` | `0.0` | BEV mask 좌우 여백 비율입니다. 현재 전체 폭을 사용합니다. |
+| `mask_roi_margin_y` | `0.0` | BEV mask 상하 여백 비율입니다. 현재 전체 높이를 사용합니다. |
+
+## [BEV ROI]
+
+| 변수 | 기본값 | 의미와 조정 효과 |
+|---|---:|---|
+| `ipm_tl_x`, `ipm_tl_y` | `0.13`, `0.46` | 원본 영상에서 BEV 사다리꼴 왼쪽 위 점의 정규화 좌표입니다. |
+| `ipm_tr_x`, `ipm_tr_y` | `0.91`, `0.46` | 오른쪽 위 점입니다. |
+| `ipm_bl_x`, `ipm_bl_y` | `-0.05`, `0.94` | 왼쪽 아래 점입니다. 화면 밖 좌표도 허용합니다. |
+| `ipm_br_x`, `ipm_br_y` | `1.09`, `0.94` | 오른쪽 아래 점입니다. 화면 밖 좌표도 허용합니다. |
+| `bev_lane_width` | `328` | 한쪽 경계만 보일 때 반대 경계와 차선 중심을 복원할 BEV 차선 폭입니다. |
+| `center_offset` | `0` | 목표 차선 중심을 좌우로 옮기는 픽셀 보정값입니다. 방향은 화면에서 확인하며 작은 값부터 조정합니다. |
+| `inner_lane_solid_side` | `left` | INNER 판정에서 solid가 있어야 하는 쪽 기준입니다. 설치 방향과 모델 좌표계가 바뀌면 확인합니다. |
+
+IPM 좌표는 `Lane ROI / Drive Controls`에서 실시간 조절할 수 있습니다. 카메라 비율을 바꾸지 말고 실제 차선이 BEV에서 거의 평행해지도록 맞춥니다.
+
+## [solid 가로선 필터]
+
+| 변수 | 기본값 | 의미와 조정 효과 |
+|---|---:|---|
+| `solid_orientation_filter_enabled` | `1` | solid 방향 필터를 사용합니다. |
+| `solid_min_component_pixels` | `20` | 연결된 solid 조각의 최소 픽셀 수입니다. 높이면 작은 잡음을 줄이지만 먼 solid를 잃을 수 있습니다. |
+| `solid_min_vertical_span_px` | `30` | BEV에서 solid 조각이 가져야 하는 최소 세로 길이입니다. 높이면 가로선을 더 강하게 제외합니다. |
+| `solid_max_angle_from_vertical_deg` | `60.0` | 수직축에서 허용하는 최대 각도입니다. 낮추면 가로선 제거가 강해지지만 커브 solid도 사라질 수 있습니다. |
+| `solid_prev_angle_tolerance_deg` | `35.0` | 이전 정상 solid 기울기와 현재 후보의 최대 각도 차이입니다. 낮추면 갑작스러운 오검출을 더 많이 제거합니다. |
+| `solid_fit_corridor_px` | `18` | fitted solid 경로에서 이 거리보다 먼 픽셀 가지를 제거합니다. |
+| `solid_angle_ema_alpha` | `0.25` | 정상 solid 각도의 EMA 반영률입니다. 높이면 새 기울기에 빨리 반응하지만 흔들림도 커집니다. |
+| `solid_angle_reacquire_frames` | `5` | 정상 후보가 없을 때 이전 각도 기준을 해제하기까지의 프레임 수입니다. |
+
+오판을 줄이려고 `solid_min_vertical_span_px`와 각도 기준을 동시에 과도하게 조이면 정상 좌회전 곡선까지 사라질 수 있습니다. 한 번에 한 변수만 바꾸고 `solid_filter_kept_pixels`, `solid_filter_rejected_pixels` 로그를 비교합니다.
+
+## [일반 조향]
+
+| 변수 | 기본값 | 의미와 조정 효과 |
+|---|---:|---|
+| `kp` | `1.8` | 차선 중심 위치 오차 비례 gain입니다. 높이면 중심 복귀가 강해지지만 좌우 진동이 늘 수 있습니다. |
+| `kd` | `6.0` | 오차 변화량 감쇠 gain입니다. 너무 높으면 조향이 튈 수 있습니다. |
+| `steer_right_gain` | `1.0` | 한쪽 조향만 약할 때 보정하는 gain입니다. |
+| `steer_sign` | `-1` | 조향 부호입니다. 차량이 반대로 꺾이면 배선보다 먼저 이 값과 펌웨어 방향을 확인합니다. |
+| `curve_gain` | `0.6` | 곡선에서 한쪽 경계로 복원하는 보정 강도입니다. |
+| `lookahead_gain` | `5.0` | 먼 밴드 차선 중심을 미리 따라가는 gain입니다. 높이면 좌회전에 빨리 반응하지만 과조향할 수 있습니다. |
+| `lookahead_exit_scale` | `1.5` | 커브 출구에서 lookahead를 줄이는 배율 기준입니다. |
+| `lookahead_exit_delta_px` | `1.0` | 커브 출구로 판단할 가까운/먼 중심 차이 기준입니다. |
+| `lookahead_exit_confirm_frames` | `1` | 커브 출구 상태 확정 프레임 수입니다. |
+| `heading_gain` | `0.6` | 실제 차선 기울기 보정 gain입니다. |
+| `heading_ema_alpha` | `1.0` | heading EMA 반영률입니다. `1.0`은 현재값을 바로 사용합니다. |
+| `heading_clamp` | `1.0` | heading 보정 절댓값 한계입니다. |
+| `heading_min_bands` | `2` | heading 계산에 필요한 최소 밴드 수입니다. |
+| `control_warmup_frames` | `3` | 초기/복귀 직후 위치 중심만 사용해 조향을 안정화하는 프레임 수입니다. |
+| `lost_hold_frames` | `8` | 차선을 잠깐 잃었을 때 마지막 조향을 유지할 프레임 수입니다. |
+| `lost_stop_frames` | `30` | 차선을 계속 잃으면 안전 정지할 프레임 수입니다. |
+| `steer_mode` | `continuous` | Arduino 조향 명령 형식 기준입니다. 펌웨어와 일치해야 합니다. |
+
+## [속도]
+
+| 변수 | 기본값 | 의미와 조정 효과 |
+|---|---:|---|
+| `drive_pwm` | `220` | 일반 주행 목표 PWM이자 회피 후 복구 목표입니다. 범위는 1~255입니다. |
+| `slow_pwm` | `220` | 일반 조향이 클 때 사용할 감속 PWM입니다. 현재 drive PWM과 같아 실질 감속이 없습니다. |
+| `slow_steer_thresh` | `0.55` | 조향 절댓값이 이 값 이상일 때 `slow_pwm`을 사용합니다. |
+| `recovery_ramp_start_pwm` | `70` | 회피 완료 후 속도 복구 시작 PWM입니다. |
+| `recovery_ramp_duration_s` | `3.0` | 복구 시작 PWM에서 `drive_pwm`까지 증가하는 실제 주행 시간입니다. |
+
+## [Arduino와 초음파]
+
+| 변수 | 기본값 | 의미와 조정 효과 |
+|---|---:|---|
+| `serial_port` | `COM3` | Arduino 포트입니다. Windows 장치 관리자에서 확인합니다. |
+| `baud` | `115200` | 시리얼 속도입니다. 펌웨어 값과 반드시 같아야 합니다. |
+| `ultrasonic_enabled` | `1` | 초음파 수신과 회피 융합을 사용합니다. |
+| `us_front_ids` | `[0,1]` | 전방 거리로 사용할 센서 ID입니다. 실제 펌웨어 출력 ID와 맞아야 합니다. |
+| `sensor_timeout_s` | `0.8` | 마지막 센서 샘플의 최대 사용 나이입니다. |
+| `sensor_min_valid_cm` | `2` | 이보다 작은 값은 무효입니다. |
+| `sensor_max_valid_cm` | `400` | 이보다 큰 값은 무효입니다. 250은 이 범위 안이므로 유효한 먼 거리입니다. |
+| `sensor_required` | `1` | 유효한 전방 센서가 없을 때 안전 정지합니다. 실제 주행에서는 `1`을 유지합니다. |
+| `fsm_max_step_s` | `0.25` | 프레임 지연 한 번이 회피 타이머를 과도하게 건너뛰지 않도록 한 번에 누적할 최대 시간입니다. |
+
+## [자동차+초음파 융합]
+
+| 변수 | 기본값 | 의미와 조정 효과 |
+|---|---:|---|
+| `obs_trigger_cm` | `150` | 전방 최솟값이 이 거리보다 가까워야 융합 조건을 만족합니다. 높이면 더 멀리서 회피 후보가 됩니다. |
+| `obs_trigger_hits` | `1` | 새로운 자동차 결과와 새로운 초음파 샘플 조합이 연속으로 필요한 횟수입니다. 높이면 오회피는 줄지만 시작이 늦어집니다. |
+| `fusion_max_skew_s` | `0.6` | 자동차 프레임 촬영 시각과 초음파 수신 시각의 최대 차이입니다. |
+| `obstacle_slow_cm` | `30` | 융합 확정 후 매우 가까울 때 추가 감속하는 거리입니다. |
+| `obstacle_slow_pwm` | `10` | 매우 가까울 때의 PWM 제한입니다. 너무 낮으면 차량이 사실상 멈출 수 있습니다. |
+
+`obs_trigger_cm`만 크게 올리면 벽이나 바닥 반사를 자동차 결과와 우연히 묶을 가능성이 커집니다. `fusion_skew_s`, 카메라 구도, 센서 각도를 같이 확인합니다.
+
+## [회피 방향과 시간]
+
+| 변수 | 기본값 | 의미와 조정 효과 |
+|---|---:|---|
+| `direction_confirm_frames` | `3` | dash가 같은 쪽에서 연속 확인되어야 방향 후보를 확정하는 프레임 수입니다. |
+| `direction_hold_frames` | `5` | dash가 잠깐 사라졌을 때 마지막 확정 방향을 유지하는 프레임 수입니다. 방향을 반대로 조향하는 시간이 아닙니다. |
+| `change_steer` | `1.0` | 차선 변경 조향 절댓값입니다. |
+| `change_t_pre` | `0.0` | 방향 잠금 뒤 본 조향 전 준비 시간입니다. |
+| `change_duration_inner_to_outer_s` | `2.0` | INNER에서 OUTER 방향으로 실제 조향하는 시간입니다. |
+| `change_duration_outer_to_inner_s` | `2.2` | OUTER에서 INNER 방향으로 실제 조향하는 시간입니다. |
+| `counter_steer_duration_s` | `1.2` | 차선 변경 후 반대 방향으로 조향해 자세를 복원하는 시간입니다. |
+| `change_pwm` | `90` | PREPARE/CHANGING/COUNTER_STEER 중 목표 PWM 상한입니다. |
+
+회피 시간은 실제 모터가 움직인 시간만 누적합니다. 사용자가 정지하거나 센서 이상으로 모션이 막힌 동안에는 회피 타이머가 진행되지 않습니다. 두 방향 시간을 바꿀 때는 0.1초 단위로 조정하고, 한 방향씩 영상으로 확인합니다.
+
+## [화면]
+
+| 변수 | 기본값 | 의미와 조정 효과 |
+|---|---:|---|
+| `view_width`, `view_height` | `896`, `504` | Integrated Drive의 각 차선 영상 표시 크기입니다. 16:9 비율입니다. |
+| `panel_width` | `540` | 오른쪽 상태 패널 폭입니다. 줄이면 글자가 잘릴 수 있습니다. |
+
+이 값은 화면 표시만 바꾸며 카메라 캡처와 모델 입력 해상도에는 영향을 주지 않습니다.
+
+## [로그와 영상]
+
+| 변수 | 기본값 | 의미와 조정 효과 |
+|---|---:|---|
+| `logging_enabled` | `0` | session JSON과 CSV 기록을 사용합니다. 현재 `0`이므로 영상도 기록하지 않습니다. |
+| `log_dir` | `logs` | 0805 폴더를 기준으로 한 로그 폴더입니다. |
+| `log_video_enabled` | `1` | AVI 네 개를 기록합니다. |
+| `log_clean_traffic_video_enabled` | `1` | `traffic_clean.avi`를 기록합니다. |
+| `log_clean_lane_video_enabled` | `1` | `lane_clean.avi`를 기록합니다. |
+| `log_video_fps` | `15.0` | AVI 메타데이터 FPS입니다. 실제 루프 FPS와 다르면 재생 속도가 달라질 수 있습니다. |
+| `log_video_codec` | `MJPG` | Windows 호환 AVI 코덱입니다. |
+| `log_flush_interval_s` | `1.0` | CSV를 디스크에 flush하는 간격입니다. |
+| `log_ultrasonic_ids` | `[0,1,2,3,4,5,6,7]` | CSV에 기록할 초음파 ID 목록입니다. 제어용 ID 목록과는 별개입니다. |
+
+## [안전한 조정 순서]
+
+1. `-DryRun`에서 클래스와 confidence를 확인합니다.
+2. `ipm_*`, `bev_lane_width`, `center_offset`으로 차선 중심을 먼저 맞춥니다.
+3. 낮은 `drive_pwm`에서 `kp`, `kd`, `heading_gain`을 조정합니다.
+4. 자동차 confidence와 초음파 거리 로그를 따로 확인합니다.
+5. `change_duration_inner_to_outer_s`와 `change_duration_outer_to_inner_s`를 방향별로 맞춥니다.
+6. 마지막에 `drive_pwm`, `change_pwm`, 복구 시간을 올립니다.
+
+한 번에 여러 변수를 바꾸면 원인을 찾기 어렵습니다. 매 주행의 `session.json`, `telemetry.csv`, 네 AVI를 보관하고 한 그룹씩 변경하는 것이 안전합니다.
