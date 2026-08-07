@@ -12,14 +12,46 @@ class ObstacleDecision:
     sensor_ok: bool
     distance_cm: Optional[int]
     phase: str
+    mission_completed: bool = False
 
 
 class ObstacleController:
+    """
+    장애물 회피: outer 에서 출발 -> inner 로 피함 -> 무조건 outer 로 복귀 -> 종료.
+
+    ★ 회피 방향을 차선 카메라에서 받지 않는다 ★
+      예전에는 차선 모델이 알려준 dash_side 로 어느 쪽으로 피할지 정했다. 그래서
+      점선을 못 찾으면 WAIT_DASH 에 머물러 **회피 자체를 시작하지 못하는** 실패
+      모드가 있었다. 지금은 "항상 outer 에서 출발한다"를 전제로 깔았으므로
+      첫 기동은 언제나 outer->inner, 복귀는 언제나 inner->outer 다. 방향은
+      `inner_lane_side` 설정 하나로 결정되고 런타임 인식에 의존하지 않는다.
+
+    상태 흐름:
+      KEEP ─(stroller + 초음파 융합 확인)→ [CHG_PRE] → CHANGING → COUNTER_STEER
+           → INNER_HOLD ─(inner_hold_s 경과)→ RETURN_CHANGING → RETURN_COUNTER
+           → DONE (이후 장애물 무시)
+
+    INNER_HOLD 는 회피 기동이 아니다. 이 구간에서는 조향을 넘기지 않고 평소대로
+    차선 추종으로 달린다. 그래서 `avoidance_in_progress()` 에 포함되지 않는다.
+
+    `avoidance_completed` 는 "기동이 방금 끝났다"는 뜻이라 **두 번** 뜬다
+    (inner 진입 직후, outer 복귀 직후). 실행부는 이 신호로 차선 추종을 다시
+    잠그고 속도 램프를 시작하므로, 차선을 갈아탄 두 시점 모두에서 필요하다.
+    미션 자체가 끝나는 시점은 `mission_completed` 로 따로 알린다.
+    """
+
     KEEP = "KEEP"
-    WAIT_DASH = "WAIT_DASH"
     CHG_PRE = "CHG_PRE"
     CHANGING = "CHANGING"
     COUNTER_STEER = "COUNTER_STEER"
+    INNER_HOLD = "INNER_HOLD"
+    RETURN_CHANGING = "RETURN_CHANGING"
+    RETURN_COUNTER = "RETURN_COUNTER"
+    DONE = "DONE"
+
+    MANEUVER_STATES = frozenset(
+        {CHG_PRE, CHANGING, COUNTER_STEER, RETURN_CHANGING, RETURN_COUNTER}
+    )
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -38,6 +70,7 @@ class ObstacleController:
         self.fusion_skew_s = None
         self.fusion_reason = "waiting"
 
+        # 회피 방향은 설정에서 나오지만, 어느 쪽으로 갔는지 기록은 남긴다(로그/UI용)
         self.dash_side = None
         self.locked_dash_side = None
         self.locked_change_direction = None
@@ -47,6 +80,28 @@ class ObstacleController:
         self._direction_hits = 0
         self._direction_misses = 0
 
+    # ── 방향 ────────────────────────────────────────────────
+    def inner_side(self):
+        """inner 차선이 차체 기준 어느 쪽인가. 'left' 또는 'right'."""
+        side = self.cfg.get("inner_lane_side")
+        if side is None:
+            # 예전 키에서 유추: inner 차선의 실선이 왼쪽이면 inner 차선도 왼쪽이다
+            side = self.cfg.get("inner_lane_solid_side", "left")
+        side = str(side).lower()
+        return side if side in {"left", "right"} else "left"
+
+    def _steer_side(self, side):
+        # 시리얼 프로토콜은 양수가 왼쪽, 음수가 오른쪽이다
+        steer = abs(float(self.cfg.get("change_steer", 1.0)))
+        return steer if side == "left" else -steer
+
+    def _steer_to_inner(self):
+        return self._steer_side(self.inner_side())
+
+    def _steer_to_outer(self):
+        return -self._steer_to_inner()
+
+    # ── 시간 ────────────────────────────────────────────────
     def _start(self, state):
         self.state = state
         self.state_elapsed = 0.0
@@ -91,9 +146,7 @@ class ObstacleController:
         return distance, token, True
 
     def update_lane_context(self, dash_side=None, solid_side=None):
-        if self.state not in {self.KEEP, self.WAIT_DASH}:
-            return
-
+        """회피 방향 결정에는 더 이상 쓰지 않는다. 화면/로그 표시용 기록만 남긴다."""
         candidate = dash_side if dash_side in {"left", "right"} else None
         if candidate is None and solid_side in {"left", "right"}:
             candidate = "right" if solid_side == "left" else "left"
@@ -117,14 +170,14 @@ class ObstacleController:
             self.dash_side = candidate
 
     def lane_recognition_enabled(self):
-        return self.state in {self.KEEP, self.WAIT_DASH}
+        """기동 중에는 차선을 가로지르므로 추적을 끈다. 그 외에는 켠다."""
+        return not self.avoidance_in_progress()
 
     def avoidance_in_progress(self):
-        return self.state in {
-            self.CHG_PRE,
-            self.CHANGING,
-            self.COUNTER_STEER,
-        }
+        return self.state in self.MANEUVER_STATES
+
+    def mission_finished(self):
+        return self.state == self.DONE
 
     def _reset_direction_context(self):
         self.dash_side = None
@@ -135,34 +188,28 @@ class ObstacleController:
         self._direction_hits = 0
         self._direction_misses = 0
 
-    def _lock_direction(self):
-        if self.dash_side not in {"left", "right"}:
-            return False
-        self.locked_dash_side = self.dash_side
-        inner_solid_side = str(
-            self.cfg.get("inner_lane_solid_side", "left")
-        ).lower()
-        if inner_solid_side not in {"left", "right"}:
-            inner_solid_side = "left"
-        if self.locked_dash_side == inner_solid_side:
-            self.locked_change_direction = "outer_to_inner"
-            duration_key = "change_duration_outer_to_inner_s"
-        else:
-            self.locked_change_direction = "inner_to_outer"
-            duration_key = "change_duration_inner_to_outer_s"
-        legacy_duration = float(self.cfg.get("change_duration_s", 2.0))
+    def _begin_avoid(self):
+        """outer -> inner 기동 준비. 방향은 설정에서 나오므로 실패할 수 없다."""
+        inner = self.inner_side()
+        self.locked_dash_side = inner
+        self.locked_change_direction = "outer_to_inner"
+        legacy = float(self.cfg.get("change_duration_s", 2.0))
         self.locked_change_duration_s = max(
-            0.0, float(self.cfg.get(duration_key, legacy_duration))
+            0.0, float(self.cfg.get("change_duration_outer_to_inner_s", legacy))
         )
-        return True
+        self._lock_maneuver_speed()
 
-    def _steer_toward_dash(self):
-        steer = abs(float(self.cfg.get("change_steer", 1.0)))
-        # The serial protocol uses positive steering for left and negative for right.
-        return steer if self.locked_dash_side == "left" else -steer
-
-    def _steer_away_from_dash(self):
-        return -self._steer_toward_dash()
+    def _begin_return(self):
+        """inner -> outer 복귀 기동 준비."""
+        outer = "right" if self.inner_side() == "left" else "left"
+        self.locked_dash_side = outer
+        self.locked_change_direction = "inner_to_outer"
+        legacy = float(self.cfg.get("change_duration_s", 2.0))
+        self.locked_change_duration_s = max(
+            0.0, float(self.cfg.get("change_duration_inner_to_outer_s", legacy))
+        )
+        self.locked_maneuver_pwm = None
+        self._lock_maneuver_speed()
 
     def _approach_speed(self):
         if self.front_cm is None:
@@ -193,6 +240,7 @@ class ObstacleController:
         completed=False,
         sensor_ok=True,
         phase=None,
+        mission_completed=False,
     ):
         return ObstacleDecision(
             detected,
@@ -203,6 +251,7 @@ class ObstacleController:
             sensor_ok,
             self.front_cm,
             self.state if phase is None else phase,
+            mission_completed,
         )
 
     def reset(self):
@@ -278,7 +327,9 @@ class ObstacleController:
             self.fusion_confirmed = self.ultrasonic_close and (
                 (car_fresh and skew_ok) or not car_required
             )
-            if self.fusion_confirmed:
+            if self.state == self.DONE:
+                self.fusion_reason = "mission-done-ignoring"
+            elif self.fusion_confirmed:
                 self.fusion_reason = "car+ultrasonic"
             elif not self.ultrasonic_close:
                 self.fusion_reason = "ultrasonic-not-close"
@@ -321,7 +372,16 @@ class ObstacleController:
             else float(self.cfg.get("change_duration_s", 2.0))
         )
         counter_time = float(self.cfg.get("counter_steer_duration_s", 0.4))
+        return_counter_time = float(
+            self.cfg.get("return_counter_steer_duration_s", counter_time)
+        )
+        hold_time = float(self.cfg.get("inner_hold_s", 3.0))
 
+        # ── 회피 완료. 이후 장애물은 보지 않는다 ──────────────
+        if self.state == self.DONE:
+            return self._decision(False, False, phase=self.DONE)
+
+        # ── outer 주행 중, 회피 트리거 대기 ────────────────────
         if self.state == self.KEEP:
             if not motion_enabled:
                 self.front_hits = 0
@@ -332,30 +392,13 @@ class ObstacleController:
 
             if self.front_hits >= int(self.cfg.get("obs_trigger_hits", 3)):
                 self.front_hits = 0
-                if not self._lock_direction():
-                    self._start(self.WAIT_DASH)
-                    return self._decision(
-                        True,
-                        False,
-                        self._approach_speed(),
-                        None,
-                    )
+                self._begin_avoid()
                 if pre_time > 0:
-                    self._lock_maneuver_speed()
                     self._start(self.CHG_PRE)
-                    return self._decision(
-                        True,
-                        True,
-                        self._maneuver_speed(),
-                        0.0,
-                    )
-                self._lock_maneuver_speed()
+                    return self._decision(True, True, self._maneuver_speed(), 0.0)
                 self._start(self.CHANGING)
                 return self._decision(
-                    True,
-                    True,
-                    self._maneuver_speed(),
-                    self._steer_toward_dash(),
+                    True, True, self._maneuver_speed(), self._steer_to_inner()
                 )
 
             return self._decision(
@@ -365,53 +408,22 @@ class ObstacleController:
                 None,
             )
 
-        if self.state == self.WAIT_DASH:
-            if new_sample and not obstacle_detected:
-                self._start(self.KEEP)
-                return self._decision(False, False, self._approach_speed(), None)
-            if self._lock_direction():
-                if pre_time > 0:
-                    self._lock_maneuver_speed()
-                    self._start(self.CHG_PRE)
-                    return self._decision(
-                        True,
-                        True,
-                        self._maneuver_speed(),
-                        0.0,
-                    )
-                self._lock_maneuver_speed()
-                self._start(self.CHANGING)
-                return self._decision(
-                    True,
-                    True,
-                    self._maneuver_speed(),
-                    self._steer_toward_dash(),
-                )
-            return self._decision(
-                obstacle_detected,
-                False,
-                self._approach_speed(),
-                None,
-            )
-
+        # ── 기동 전 정지/직진 (change_t_pre > 0 일 때만) ───────
         if self.state == self.CHG_PRE:
             if self.state_elapsed < pre_time:
                 return self._decision(
-                    True,
-                    True,
-                    self._maneuver_speed(),
-                    0.0,
-                    sensor_ok=sensor_ok,
+                    True, True, self._maneuver_speed(), 0.0, sensor_ok=sensor_ok
                 )
             self._start(self.CHANGING)
             return self._decision(
                 True,
                 True,
                 self._maneuver_speed(),
-                self._steer_toward_dash(),
+                self._steer_to_inner(),
                 sensor_ok=sensor_ok,
             )
 
+        # ── outer -> inner ────────────────────────────────────
         if self.state == self.CHANGING:
             if self.state_elapsed >= change_time:
                 self._start(self.COUNTER_STEER)
@@ -419,29 +431,29 @@ class ObstacleController:
                     True,
                     True,
                     self._maneuver_speed(),
-                    self._steer_away_from_dash(),
+                    self._steer_to_outer(),
                     sensor_ok=sensor_ok,
                 )
             return self._decision(
                 True,
                 True,
                 self._maneuver_speed(),
-                self._steer_toward_dash(),
+                self._steer_to_inner(),
                 sensor_ok=sensor_ok,
             )
 
         if self.state == self.COUNTER_STEER:
             if self.state_elapsed >= counter_time:
-                completed_speed = self._maneuver_speed()
-                self._start(self.KEEP)
+                settled_speed = self._maneuver_speed()
+                self._start(self.INNER_HOLD)
                 self.front_hits = 0
                 self.front_cm = None
-                self._reset_direction_context()
                 self.locked_maneuver_pwm = None
+                # inner 차선에 자리잡았다. 여기서 차선 추종을 다시 잠근다.
                 return self._decision(
                     False,
                     False,
-                    completed_speed,
+                    settled_speed,
                     None,
                     completed=True,
                     sensor_ok=sensor_ok,
@@ -450,7 +462,67 @@ class ObstacleController:
                 True,
                 True,
                 self._maneuver_speed(),
-                self._steer_away_from_dash(),
+                self._steer_to_outer(),
+                sensor_ok=sensor_ok,
+            )
+
+        # ── inner 차선 주행 유지. 조향은 차선 추종에 맡긴다 ────
+        if self.state == self.INNER_HOLD:
+            if not motion_enabled:
+                return self._decision(False, False, phase="INNER_HOLD_PAUSED")
+            if self.state_elapsed >= hold_time:
+                self._begin_return()
+                self._start(self.RETURN_CHANGING)
+                return self._decision(
+                    False,
+                    True,
+                    self._maneuver_speed(),
+                    self._steer_to_outer(),
+                    sensor_ok=sensor_ok,
+                )
+            return self._decision(False, False, None, None, sensor_ok=sensor_ok)
+
+        # ── inner -> outer 복귀 ───────────────────────────────
+        if self.state == self.RETURN_CHANGING:
+            if self.state_elapsed >= change_time:
+                self._start(self.RETURN_COUNTER)
+                return self._decision(
+                    False,
+                    True,
+                    self._maneuver_speed(),
+                    self._steer_to_inner(),
+                    sensor_ok=sensor_ok,
+                )
+            return self._decision(
+                False,
+                True,
+                self._maneuver_speed(),
+                self._steer_to_outer(),
+                sensor_ok=sensor_ok,
+            )
+
+        if self.state == self.RETURN_COUNTER:
+            if self.state_elapsed >= return_counter_time:
+                settled_speed = self._maneuver_speed()
+                self._start(self.DONE)
+                self.front_hits = 0
+                self.front_cm = None
+                self._reset_direction_context()
+                self.locked_maneuver_pwm = None
+                return self._decision(
+                    False,
+                    False,
+                    settled_speed,
+                    None,
+                    completed=True,
+                    sensor_ok=sensor_ok,
+                    mission_completed=True,
+                )
+            return self._decision(
+                False,
+                True,
+                self._maneuver_speed(),
+                self._steer_to_inner(),
                 sensor_ok=sensor_ok,
             )
 

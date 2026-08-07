@@ -123,17 +123,30 @@ DEFAULTS = {
     "direction_hold_frames": 5,
     "change_steer": 1.0,
     "change_t_pre": 0.0,
-    "change_duration_inner_to_outer_s": 2.0,
-    "change_duration_outer_to_inner_s": 2.0,
-    "counter_steer_duration_s": 1.5,
-    # 복귀 기동 뒤 정렬 시간. 비워두면 counter_steer_duration_s 를 그대로 쓴다
-    "return_counter_steer_duration_s": 1.5,
-    # 회피로 inner 에 들어간 뒤 outer 로 복귀하기까지 유지할 시간.
-    # 장애물을 완전히 지나칠 만큼이어야 한다. 핵심 튜닝값이다.
-    "inner_hold_s": 3.0,
-    # inner 차선이 차체 기준 어느 쪽인가. 회피/복귀 방향이 여기서만 결정된다.
-    # 회피가 반대로 나가면 이 값을 뒤집을 것.
-    "inner_lane_side": "left",
+    # ── 장애물 회피 v2 ────────────────────────────────────
+    # 현재 차선. 1↔2 를 토글하며 회피 방향을 정한다. 출발 차선을 적는다.
+    "start_lane_mode": 2,
+    # 1차선이 차체 기준 어느 쪽인가. 회피가 반대로 나가면 이 값을 뒤집을 것.
+    "lane1_side": "left",
+    # 차선 모델의 INNER/OUTER 추정으로 lane_mode 를 따라가게 할지.
+    # 기본 0(끔) — 시야가 흔들리면 lane_mode 가 멋대로 바뀌어 회피 방향이 뒤집힌다.
+    "lane_mode_follow_vision": 0,
+    # 초음파 시간창(초). 이 동안의 **최솟값**을 전방 거리로 쓴다.
+    # 펌웨어는 에코를 못 받으면 250 을 반환하는데(못 읽음), 순간값을 그대로
+    # 쓰면 그 250 이 연속감지 카운트를 리셋해 회피가 영영 발동하지 않는다.
+    "us_window_s": 0.3,
+    # 펌웨어 타임아웃 sentinel. 이 값 이상은 '측정 실패'로 보고 창에 안 넣는다.
+    "us_timeout_cm": 250,
+    # 노이즈 필터: 초음파가 이만큼 연속으로 가까워야 장애물로 인정
+    "avoid_confirm_frames": 5,
+    # 커브 필터: 조향 절대값이 이 이하(직선)일 때만 회피한다.
+    # 커브를 돌 때 정면 벽을 장애물로 오인하는 걸 막는 핵심 값이다.
+    "avoid_max_steer": 0.4,
+    # 핸들을 꺾고 유지하는 시간과 그때의 강제 조향값
+    "lane_change_seconds": 1.4,
+    "lane_change_steer": 1.0,
+    # 회피 직후 재발동 금지 시간 (잘못된 차선/센서 노이즈로 인한 2차 회피 방지)
+    "avoid_cooldown_seconds": 2.0,
     "change_pwm": 70,
     "recovery_ramp_start_pwm": 70,
     "recovery_ramp_duration_s": 3.0,

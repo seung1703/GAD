@@ -30,9 +30,10 @@ CSV_FIELDS = [
     "car_roi_candidate_count", "car_roi_rejected_count",
     "ultrasonic_json", "ultrasonic_age_json",
     "front_sensor_values", "front_distance_cm", "sensor_ok",
-    "ultrasonic_close", "fusion_confirmed", "fusion_hits", "fusion_skew_s",
-    "fusion_reason", "obstacle_phase", "dash_side", "solid_side",
-    "locked_dash_side", "lost_frames",
+    "ultrasonic_close", "front_blocked", "front_hit_count", "straight_ok",
+    "lane_mode", "avoid_state", "block_reason",
+    "obstacle_phase", "dash_side", "solid_side",
+    "lost_frames",
 ]
 
 

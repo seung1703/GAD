@@ -313,38 +313,116 @@ class ObstacleFusionTests(unittest.TestCase):
         self.assertEqual(blocked.phase, "KEEP_PAUSED")
         self.assertEqual(self.controller.front_hits, 0)
 
-    def test_direction_specific_change_durations_are_locked_and_used(self):
+    def test_avoidance_goes_to_inner_then_always_returns_to_outer(self):
+        """회피 1회 = inner 로 나갔다가 반드시 outer 로 돌아오고 끝난다."""
         cfg = dict(self.cfg)
         cfg.update(
             {
-                "inner_lane_solid_side": "left",
-                "change_duration_inner_to_outer_s": 0.4,
+                "inner_lane_side": "left",
                 "change_duration_outer_to_inner_s": 0.8,
+                "change_duration_inner_to_outer_s": 0.6,
+                "counter_steer_duration_s": 0.2,
+                "return_counter_steer_duration_s": 0.2,
+                "inner_hold_s": 1.0,
                 "fsm_max_step_s": 1.0,
+                "obs_trigger_hits": 1,
             }
         )
+        ctl = ObstacleController(cfg)
 
-        inner_to_outer = ObstacleController(cfg)
-        inner_to_outer.update_lane_context(dash_side="right")
-        self.assertTrue(inner_to_outer._lock_direction())
-        self.assertEqual(inner_to_outer.locked_change_direction, "inner_to_outer")
-        self.assertEqual(inner_to_outer.locked_change_duration_s, 0.4)
-        inner_to_outer._start(inner_to_outer.CHANGING)
-        inner_to_outer.last_update_ts = 0.0
-        inner_to_outer.decide(0.5, {}, {})
-        self.assertEqual(inner_to_outer.state, inner_to_outer.COUNTER_STEER)
+        def step(now, distance=40, car=True, seq=1):
+            return ctl.decide(
+                now,
+                {0: distance, 1: distance + 2},
+                {0: now, 1: now},
+                motion_enabled=True,
+                car_detected=car,
+                car_frame_time=now if car else None,
+                car_sequence=seq if car else -1,
+            )
 
-        outer_to_inner = ObstacleController(cfg)
-        outer_to_inner.update_lane_context(dash_side="left")
-        self.assertTrue(outer_to_inner._lock_direction())
-        self.assertEqual(outer_to_inner.locked_change_direction, "outer_to_inner")
-        self.assertEqual(outer_to_inner.locked_change_duration_s, 0.8)
-        outer_to_inner._start(outer_to_inner.CHANGING)
-        outer_to_inner.last_update_ts = 0.0
-        outer_to_inner.decide(0.5, {}, {})
-        self.assertEqual(outer_to_inner.state, outer_to_inner.CHANGING)
-        outer_to_inner.decide(0.9, {}, {})
-        self.assertEqual(outer_to_inner.state, outer_to_inner.COUNTER_STEER)
+        # 융합 확인 즉시 inner 로 조향 (왼쪽 = 양수)
+        first = step(0.0)
+        self.assertEqual(ctl.state, ctl.CHANGING)
+        self.assertGreater(first.requested_steering, 0)
+
+        # 기동 시간이 지나면 반대조향으로 정렬
+        step(0.9)
+        self.assertEqual(ctl.state, ctl.COUNTER_STEER)
+
+        # 정렬이 끝나면 inner 차선 유지 구간. 조향은 차선 추종에 넘긴다
+        settled = step(1.2)
+        self.assertEqual(ctl.state, ctl.INNER_HOLD)
+        self.assertTrue(settled.avoidance_completed)
+        self.assertFalse(settled.mission_completed)
+        self.assertIsNone(settled.requested_steering)
+        self.assertFalse(settled.avoidance_active)
+
+        # 유지 시간이 지나면 장애물이 있든 없든 outer 로 복귀 시작
+        step(2.3)
+        self.assertEqual(ctl.state, ctl.RETURN_CHANGING)
+
+        step(3.0)
+        self.assertEqual(ctl.state, ctl.RETURN_COUNTER)
+
+        done = step(3.3)
+        self.assertEqual(ctl.state, ctl.DONE)
+        self.assertTrue(done.avoidance_completed)
+        self.assertTrue(done.mission_completed)
+
+    def test_inner_hold_returns_even_while_obstacle_still_close(self):
+        """복귀는 시간 기준이다. 초음파가 계속 가깝다고 inner 에 갇히면 안 된다."""
+        cfg = dict(self.cfg)
+        cfg.update({"inner_hold_s": 0.5, "fsm_max_step_s": 1.0})
+        ctl = ObstacleController(cfg)
+        ctl._start(ctl.INNER_HOLD)
+        ctl.last_update_ts = 0.0
+        ctl.decide(0.6, {0: 20, 1: 20}, {0: 0.6, 1: 0.6}, car_detected=True, car_frame_time=0.6)
+        self.assertEqual(ctl.state, ctl.RETURN_CHANGING)
+
+    def test_done_ignores_further_obstacles(self):
+        """1회 회피 후에는 장애물+초음파가 다시 맞아도 회피하지 않는다."""
+        ctl = ObstacleController(dict(self.cfg))
+        ctl._start(ctl.DONE)
+        for index in range(5):
+            now = 50.0 + index * 0.1
+            decision = ctl.decide(
+                now,
+                {0: 20, 1: 22},
+                {0: now, 1: now},
+                car_detected=True,
+                car_frame_time=now,
+                car_sequence=index,
+            )
+            self.assertFalse(decision.avoidance_active)
+            self.assertFalse(decision.obstacle_detected)
+        self.assertEqual(ctl.state, ctl.DONE)
+
+    def test_reset_rearms_obstacle_mission_from_done(self):
+        """정지 후 s(전체 리셋)를 누르면 회피 미션도 처음 상태로 돌아온다."""
+        ctl = ObstacleController(dict(self.cfg))
+        ctl._start(ctl.DONE)
+        ctl.reset()
+        self.assertEqual(ctl.state, ctl.KEEP)
+        self.assertFalse(ctl.mission_finished())
+
+    def test_inner_side_flips_every_steering_sign(self):
+        """inner_lane_side 하나만 뒤집으면 회피/복귀 방향이 통째로 뒤집힌다."""
+        left = ObstacleController(dict(self.cfg, inner_lane_side="left"))
+        right = ObstacleController(dict(self.cfg, inner_lane_side="right"))
+        self.assertGreater(left._steer_to_inner(), 0)
+        self.assertLess(left._steer_to_outer(), 0)
+        self.assertLess(right._steer_to_inner(), 0)
+        self.assertGreater(right._steer_to_outer(), 0)
+
+    def test_lane_tracking_runs_except_during_maneuvers(self):
+        ctl = ObstacleController(dict(self.cfg))
+        for state in (ctl.KEEP, ctl.INNER_HOLD, ctl.DONE):
+            ctl._start(state)
+            self.assertTrue(ctl.lane_recognition_enabled(), state)
+        for state in (ctl.CHANGING, ctl.COUNTER_STEER, ctl.RETURN_CHANGING, ctl.RETURN_COUNTER):
+            ctl._start(state)
+            self.assertFalse(ctl.lane_recognition_enabled(), state)
 
 
 if __name__ == "__main__":

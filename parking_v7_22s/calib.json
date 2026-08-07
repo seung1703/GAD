@@ -1,0 +1,16 @@
+{
+  "park_home_enable": 0,
+  "park_home_sweep": 0,
+  "park_home_dir": "left",
+  "park_home_center_pot": 744,
+  "park_home_left_pot": 818,
+  "park_home_right_pot": 689,
+  "park_home_tol": 14,
+  "park_home_land_tol": 3,
+  "park_home_retry": 3,
+  "park_home_settle_s": 0.35,
+  "park_home_timeout_s": 3.0,
+  "pot_left": 825,
+  "pot_right": 679,
+  "pot_neutral": 744
+}

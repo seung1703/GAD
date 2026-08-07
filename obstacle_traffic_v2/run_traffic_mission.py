@@ -28,7 +28,17 @@ except ImportError:
 ROOT_DIR = Path(__file__).resolve().parent
 SHARED_DIR = ROOT_DIR / "shared"
 INTRINSIC_DIR = ROOT_DIR / "camera_intrinsic"
-COMBINED_MODEL_PATH = ROOT_DIR / "model" / "best_11n.pt"
+# 새로 학습한 통합 모델을 `model/best_ob_v2.pt` 로 넣으면 그걸 쓴다.
+# 아직 없으면 예전 `model/best_11n.pt` 로 돌아가되 시끄럽게 알린다 —
+# 옛 모델은 연습장 신호등을 거의 못 잡는다(green 재현율 1.8%, red 0%).
+COMBINED_MODEL_CANDIDATES = (
+    ROOT_DIR / "model" / "best_ob_v2.pt",
+    ROOT_DIR / "model" / "best_11n.pt",
+)
+COMBINED_MODEL_PATH = next(
+    (p for p in COMBINED_MODEL_CANDIDATES if p.exists()),
+    COMBINED_MODEL_CANDIDATES[0],
+)
 LANE_MODEL_PATH = ROOT_DIR / "model" / "lane_best.pt"
 
 sys.path.insert(0, str(SHARED_DIR))
@@ -530,8 +540,11 @@ def build_status_panel(width, height, lane_detected, traffic_signal, vehicle_sta
                 ("ALL US", obstacle_info["all_sensors"], normal),
                 ("CAR", f"{obstacle_info['car_detected']}   conf:{obstacle_info['car_confidence']:.2f}   age:{obstacle_info['car_age']}", amber if obstacle_info["car_detected"] else normal),
                 ("PIPELINE", f"detector:{'ON' if obstacle_info['car_detector_enabled'] else 'OFF'}   model:{obstacle_info['car_pipeline_ok']}   sensor:{obstacle_info['sensor_ok']}", red if not obstacle_info["sensor_ok"] else normal),
-                ("FUSION", f"{obstacle_info['fusion_confirmed']}   hits:{obstacle_info['fusion_hits']}   skew:{obstacle_info['fusion_skew']}", amber if obstacle_info["fusion_confirmed"] else normal),
-                ("REASON", str(obstacle_info["fusion_reason"]), muted),
+                ("FUSION", f"blocked:{obstacle_info['front_blocked']}   us_close:{obstacle_info['ultrasonic_close']}   cooldown:{obstacle_info['cooldown']}", amber if obstacle_info["front_blocked"] else normal),
+                ("AVOID", f"{obstacle_info['avoid_state']}   lane {obstacle_info['lane_mode']}차선   "
+                          f"hits {obstacle_info['front_hit_count']}   straight:{obstacle_info['straight_ok']}",
+                 amber if obstacle_info["avoid_state"] == "changing" else normal),
+                ("REASON", str(obstacle_info["block_reason"]), muted),
                 ("AVOID PLAN", f"inner:{obstacle_info['inner_side']}   1회 후 outer 복귀   done:{obstacle_info['obstacle_mission_done']}", green if obstacle_info["obstacle_mission_done"] else normal),
             ],
         ),
@@ -539,7 +552,7 @@ def build_status_panel(width, height, lane_detected, traffic_signal, vehicle_sta
             "LANE CONTROL",
             [
                 ("BOUNDARY", f"L:{obstacle_info['bottom_left_class']}   R:{obstacle_info['bottom_right_class']}", normal),
-                ("CLASS", f"solid:{obstacle_info['solid_side']}   dash:{obstacle_info['dash_side']}   lock:{obstacle_info['locked_dash_side']}", normal),
+                ("CLASS", f"solid:{obstacle_info['solid_side']}   dash:{obstacle_info['dash_side']}", normal),
                 ("SOLID FILTER", f"{obstacle_info['solid_filter_angle']}   keep:{obstacle_info['solid_filter_kept']}   reject:{obstacle_info['solid_filter_rejected']}", normal),
                 ("ERROR", f"P:{obstacle_info['position_error']}   C:{obstacle_info['curve_term']}   H:{obstacle_info['heading_term']}", normal),
                 ("LOOKAHEAD", f"{obstacle_info['lookahead_mode']}   real:{obstacle_info['both_real_bands']}   warm:{obstacle_info['warmup_remaining']}", normal),
@@ -663,7 +676,7 @@ def obstacle_snapshot(
         f"U{sensor_id}:{distance}cm" for sensor_id, distance in sorted(us.items())
     ) or "--"
     car_age = getattr(obstacle_controller, "car_result_age_s", None)
-    fusion_skew = getattr(obstacle_controller, "fusion_skew_s", None)
+    cooldown_s = getattr(obstacle_controller, "cooldown_remaining", lambda: 0.0)()
     solid_filter_angle = getattr(lane_detector, "solid_angle_ema", None)
     return {
         "detected": decision.obstacle_detected,
@@ -675,7 +688,12 @@ def obstacle_snapshot(
         "sensor_ok": decision.sensor_ok,
         "solid_side": getattr(lane_detector, "solid_side", "--"),
         "dash_side": getattr(lane_detector, "dash_side", "--"),
-        "locked_dash_side": getattr(obstacle_controller, "locked_dash_side", "--"),
+        "lane_mode": getattr(obstacle_controller, "lane_mode", "--"),
+        "avoid_state": getattr(obstacle_controller, "avoid_state", "--"),
+        "block_reason": getattr(obstacle_controller, "block_reason", "--"),
+        "front_hit_count": getattr(obstacle_controller, "front_hit_count", 0),
+        "straight_ok": getattr(obstacle_controller, "straight_ok", False),
+        "cooldown_s": getattr(obstacle_controller, "cooldown_remaining", lambda: 0.0)(),
         "obstacle_mission_done": bool(getattr(obstacle_controller, "mission_finished", lambda: False)()),
         "inner_side": getattr(obstacle_controller, "inner_side", lambda: "--")(),
         "bottom_left_class": getattr(lane_detector, "bottom_left_class", "--"),
@@ -710,12 +728,9 @@ def obstacle_snapshot(
         "ultrasonic_close": bool(
             getattr(obstacle_controller, "ultrasonic_close", False)
         ),
-        "fusion_confirmed": bool(
-            getattr(obstacle_controller, "fusion_confirmed", False)
-        ),
-        "fusion_hits": int(getattr(obstacle_controller, "front_hits", 0)),
-        "fusion_skew": "--" if fusion_skew is None else f"{fusion_skew:.3f}s",
-        "fusion_reason": getattr(obstacle_controller, "fusion_reason", "--"),
+        "front_blocked": bool(getattr(obstacle_controller, "front_blocked", False)),
+        "ultrasonic_close": bool(getattr(obstacle_controller, "ultrasonic_close", False)),
+        "cooldown": f"{cooldown_s:.1f}s" if cooldown_s > 0 else "--",
         "speed": final_speed,
         "steer": f"{final_steer:+.2f}",
     }
@@ -762,7 +777,21 @@ def main():
         )
 
     if not COMBINED_MODEL_PATH.exists():
-        raise FileNotFoundError(f"Combined traffic/car model not found: {COMBINED_MODEL_PATH}")
+        raise FileNotFoundError(
+            "Combined traffic/car model not found. 다음 중 하나가 있어야 합니다:\n  "
+            + "\n  ".join(str(p) for p in COMBINED_MODEL_CANDIDATES)
+        )
+    slow = int(cfg.get("slow_pwm", 0))
+    drive = int(cfg.get("drive_pwm", 0))
+    if slow >= drive:
+        print(f"[avoid] ! slow_pwm({slow}) >= drive_pwm({drive}) — "
+              "차선 변경 중에 감속이 전혀 안 됩니다")
+        print("[avoid]   원본은 회피 속도로 slow_pwm 을 쓰는데, 그쪽 설정에서는")
+        print("[avoid]   slow_pwm < drive_pwm 이라 '감속'이 성립했습니다")
+    if COMBINED_MODEL_PATH.name != "best_ob_v2.pt":
+        print(f"[model] ! 구모델을 쓰고 있습니다: {COMBINED_MODEL_PATH.name}")
+        print("[model]   새로 학습한 모델을 model/best_ob_v2.pt 로 넣으세요")
+        print("[model]   구모델은 연습장 신호등을 거의 못 잡습니다 (green 1.8% / red 0%)")
     if not LANE_MODEL_PATH.exists():
         raise FileNotFoundError(f"Lane model not found: {LANE_MODEL_PATH}")
 
@@ -1025,9 +1054,8 @@ def main():
                 tracking_enabled=tracking_enabled,
             )
             lane_detected = bool(getattr(lane_detector, "last_crosswalk_detected", False))
-            obstacle_controller.update_lane_context(
-                getattr(lane_detector, "dash_side", None),
-                getattr(lane_detector, "solid_side", None),
+            obstacle_controller.update_lane_estimate(
+                getattr(lane_detector, "debug_lane_label", None)
             )
 
             new_traffic_result = (
@@ -1133,7 +1161,13 @@ def main():
                 motion_enabled=motion_enabled,
                 car_detected=effective_car_detected,
                 car_frame_time=effective_car_frame_time,
-                car_sequence=effective_car_sequence,
+                # 커브에서 정면 벽을 장애물로 오인하지 않도록 직선 주행일 때만
+                # 회피하게 한다. steer 는 이 아래에서 계산되므로 **직전 프레임에
+                # 실제로 인가한 조향**(last_steer)을 넘긴다. 한 프레임 지연은
+                # 무시할 수준이고, steer 를 쓰면 첫 루프에서 미정의가 된다.
+                current_steer=last_steer,
+                # 신호등 정지 중에는 회피를 시작하지 않는다
+                allow_avoidance=not signal_holding,
             )
 
             if obstacle.avoidance_completed:
@@ -1178,6 +1212,9 @@ def main():
                 vehicle_state = STATE_SAFE_STOP
             else:
                 vehicle_state = STATE_DRIVING
+            if obstacle.avoidance_active and vehicle_state == STATE_SAFE_STOP:
+                # 회피 중 차선 미검출은 정상이다. 안전정지로 넘기지 않는다.
+                vehicle_state = STATE_AVOIDING_OBSTACLE
 
             final_steer = steer if obstacle.requested_steering is None else float(obstacle.requested_steering)
             ramp_motion_enabled = (
@@ -1194,12 +1231,23 @@ def main():
                 motion_enabled=ramp_motion_enabled,
             )
 
+            # ── 구동 명령 우선순위 ──────────────────────────────
+            # 회피 중 강제 조향이 **차선 로스트 정지보다 위**에 있어야 한다.
+            # 차선을 가로지르는 동안에는 차선이 안 보이는 게 정상인데, 로스트
+            # 정지가 먼저 걸리면 회피 도중에 차선 한복판에 서버린다.
             if not running or paused:
                 final_speed = 0
                 link.send_brake()
             elif vehicle_state in {STATE_STOPPED_RED, STATE_SAFE_STOP}:
                 final_speed = 0
                 link.send_brake()
+            elif obstacle.avoidance_active:
+                pwm = int(obstacle.requested_speed or cfg.get("obstacle_slow_pwm", 50))
+                final_speed = max(0, pwm)
+                if final_speed <= 0:
+                    link.send_brake()
+                else:
+                    link.send_drive(final_speed, final_steer)
             elif lost_frames > cfg["lost_stop_frames"]:
                 final_speed = 0
                 vehicle_state = STATE_SAFE_STOP
@@ -1249,7 +1297,10 @@ def main():
             if log_message != last_log_message or vehicle_state != last_log_state:
                 print(
                     f"[state] {vehicle_state} traffic={traffic_signal} obstacle={obstacle_info['phase']} "
-                    f"dist={obstacle_info['distance']} sensor_ok={obstacle_info['sensor_ok']} "
+                    f"lane={obstacle_info['lane_mode']} "
+                    f"dist={obstacle_info['distance']} us={obstacle_info['front_sensors']} "
+                    f"hits={obstacle_info['front_hit_count']} why={obstacle_info['block_reason']} "
+                    f"sensor_ok={obstacle_info['sensor_ok']} "
                     f"cmd=({final_speed},{final_steer:+.2f})"
                 )
                 last_log_message = log_message
@@ -1303,8 +1354,6 @@ def main():
                 event_parts.append("signal-resume-video-recording-stopped")
             if obstacle.avoidance_completed:
                 event_parts.append("avoidance-recovery-ramp-start")
-            if obstacle.mission_completed:
-                event_parts.append("obstacle-mission-done-returned-to-outer")
             if vehicle_state != last_recorded_state:
                 event_parts.append(f"state:{last_recorded_state}->{vehicle_state}")
                 last_recorded_state = vehicle_state
@@ -1386,14 +1435,15 @@ def main():
                     "front_distance_cm": "" if obstacle.distance_cm is None else obstacle.distance_cm,
                     "sensor_ok": int(obstacle.sensor_ok),
                     "ultrasonic_close": int(obstacle_info["ultrasonic_close"]),
-                    "fusion_confirmed": int(obstacle_info["fusion_confirmed"]),
-                    "fusion_hits": obstacle_info["fusion_hits"],
-                    "fusion_skew_s": "" if obstacle_controller.fusion_skew_s is None else f"{obstacle_controller.fusion_skew_s:.3f}",
-                    "fusion_reason": obstacle_info["fusion_reason"],
+                    "front_blocked": int(obstacle_info["front_blocked"]),
+                    "front_hit_count": obstacle_info["front_hit_count"],
+                    "straight_ok": int(obstacle_info["straight_ok"]),
+                    "lane_mode": obstacle_info["lane_mode"],
+                    "avoid_state": obstacle_info["avoid_state"],
+                    "block_reason": obstacle_info["block_reason"],
                     "obstacle_phase": obstacle.phase,
                     "dash_side": getattr(lane_detector, "dash_side", ""),
                     "solid_side": getattr(lane_detector, "solid_side", ""),
-                    "locked_dash_side": obstacle_controller.locked_dash_side or "",
                     "lost_frames": lost_frames,
                 },
                 display,
